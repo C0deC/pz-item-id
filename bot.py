@@ -172,16 +172,17 @@ class SelectorItems(discord.ui.View):
         indice = int(interaction.data["values"][0])
         item = self.items[indice]
 
+        # Mensaje nuevo y público (no edita el menú efímero original),
+        # para que el resultado se vea igual de visible que una
+        # coincidencia única, tanto para items vanilla como de mods.
         if self.modo == "id":
-            await interaction.response.edit_message(
-                content=f"`{item['_full_id']}`", embed=None, view=None, attachments=[]
-            )
+            await interaction.response.send_message(f"`{item['_full_id']}`")
         else:
             embed, archivo = construir_embed(item)
-            await interaction.response.edit_message(
-                content=None, embed=embed, view=None,
-                attachments=[archivo] if archivo else []
-            )
+            if archivo:
+                await interaction.response.send_message(embed=embed, file=archivo)
+            else:
+                await interaction.response.send_message(embed=embed)
 
 
 # --- Lógica compartida entre /getid y /getinfo ----------------------------
