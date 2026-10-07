@@ -147,9 +147,12 @@ Desktop.ini
 # Regenerable using scripts from tools/
 # ------------------
 data/icons/
+data/icons_mods/
 data/icon_index.json
 data/items.json
+data/items_mods.json
 data/translations.json
+data/translations_mods.json
 
 # ------------------
 # Local copies of game assets
