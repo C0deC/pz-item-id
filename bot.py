@@ -10,13 +10,23 @@ from PIL import Image
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# --- Carga de datos ---------------------------------------------------
+# --- Carga de datos: vanilla + mods ---------------------------------------
 
 with open("data/items.json", encoding="utf-8") as f:
-    ITEMS = json.load(f)
+    items_vanilla = json.load(f)
+
+with open("data/items_mods.json", encoding="utf-8") as f:
+    items_mods = json.load(f)
+
+ITEMS = items_vanilla + items_mods
 
 with open("data/translations.json", encoding="utf-8") as f:
-    TRADUCCIONES = json.load(f)
+    traducciones_vanilla = json.load(f)
+
+with open("data/translations_mods.json", encoding="utf-8") as f:
+    traducciones_mods = json.load(f)
+
+TRADUCCIONES = {**traducciones_vanilla, **traducciones_mods}
 
 
 def primero(valor):
@@ -93,13 +103,28 @@ def buscar_items(consulta):
     return items_sugeridos
 
 
-# --- Iconos ----------------------------------------------------------
+# --- Iconos: vanilla + mods -------------------------------------------
 
-def reescalar_icono(ruta_icono, factor=4):
+def ruta_icono(item):
+    """Devuelve la ruta del icono del item, buscando primero en los
+    iconos vanilla (data/icons/) y, si no está ahí, en los de mods
+    (data/icons_mods/), o None si no hay icono en ningún sitio."""
+    if not item.get("_icon_file"):
+        return None
+    ruta_vanilla = f"data/icons/{item['_icon_file']}"
+    if os.path.exists(ruta_vanilla):
+        return ruta_vanilla
+    ruta_mod = f"data/icons_mods/{item['_icon_file']}"
+    if os.path.exists(ruta_mod):
+        return ruta_mod
+    return None
+
+
+def reescalar_icono(ruta_icono_archivo, factor=4):
     """Amplía un icono x`factor` usando NEAREST para mantener el pixel art
     nítido (sin difuminar), y lo devuelve como bytes en memoria (sin
     escribir nada a disco)."""
-    with Image.open(ruta_icono) as img:
+    with Image.open(ruta_icono_archivo) as img:
         nuevo_tamano = (img.width * factor, img.height * factor)
         img_grande = img.resize(nuevo_tamano, Image.NEAREST)
         buffer = io.BytesIO()
@@ -115,15 +140,14 @@ def construir_embed(item):
     embed.add_field(name="ID", value=f"`{item['_full_id']}`", inline=True)
     embed.add_field(name="Tipo", value=str(limpiar_tipo(item)), inline=True)
     embed.add_field(name="Categoría", value=str(primero(item.get("DisplayCategory", "?"))), inline=True)
-    embed.add_field(name="Origen", value=item.get("_source", "vanilla"), inline=True)
+    embed.add_field(name="Origen", value=item.get("_source_name") or item.get("_source", "vanilla"), inline=True)
 
     archivo = None
-    if item.get("_icon_file"):
-        ruta = f"data/icons/{item['_icon_file']}"
-        if os.path.exists(ruta):
-            buffer = reescalar_icono(ruta)
-            archivo = discord.File(buffer, filename=item["_icon_file"])
-            embed.set_image(url=f"attachment://{item['_icon_file']}")
+    ruta = ruta_icono(item)
+    if ruta:
+        buffer = reescalar_icono(ruta)
+        archivo = discord.File(buffer, filename=item["_icon_file"])
+        embed.set_image(url=f"attachment://{item['_icon_file']}")
 
     return embed, archivo
 
@@ -202,6 +226,7 @@ tree = app_commands.CommandTree(client)
 async def on_ready():
     await tree.sync()
     print(f"✅ Conectado como {client.user} (ID: {client.user.id})")
+    print(f"   {len(ITEMS)} items cargados ({len(items_vanilla)} vanilla + {len(items_mods)} de mods)")
 
 
 @tree.command(name="getid", description="Devuelve el ID de un item de Project Zomboid")
