@@ -153,6 +153,7 @@ data/items.json
 data/items_mods.json
 data/translations.json
 data/translations_mods.json
+data/vehicles.json
 
 # ------------------
 # Local copies of game assets
