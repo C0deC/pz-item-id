@@ -115,6 +115,106 @@ using the game's own scripts instead of the wiki for item data.
 
 ---
 
+## Mod support: where the data comes from
+
+**Decision:** read the mods the server has already downloaded, in
+`~/serverfiles/steamapps/workshop/content/108600/<WorkshopID>/mods/<mod_id>/`,
+instead of listing mods by hand or reading the `WorkshopItems=` line of the
+server `.ini`.
+
+**Why:** the folder on disk is the real, current set of mods the server
+runs. It avoids keeping a second list in sync (the `.ini` has ~190 entries)
+and it lets the scripts discover what each mod actually contains.
+
+**Structure found (it varies between mods, so the scripts don't assume one
+layout):**
+- A Workshop ID can hold several mods, so processed mod folders (184) are
+  more than Workshop IDs (147).
+- A mod can have several version folders (`42.0`, `42.13`...). For items,
+  only the **highest** version is read, to avoid duplicates.
+- Shared files may live in `common/` instead of the version folder.
+- `mod.info` gives the readable name (`name=`) and the internal id (`id=`).
+  Each mod item stores both: `_source` (internal id) and `_source_name`
+  (readable name, the one shown as "Origin" in the embed).
+
+**Result:** 111 mods add items (6,505 items in total); 70 contain no items
+(vehicles reskins, UI, pure Lua...); 3 had no readable `mod.info`.
+
+**Reuse:** the parsing code is the same one adapted from `pz-item-browser`
+for vanilla (see above), applied to each mod's `media/scripts`.
+
+---
+
+## Mod icons (`tools/link_icons_mods.py`)
+
+**Difference from vanilla:** mod icons are loose PNG files in
+`media/textures/` (also under `common/`), not packed in `.pack` files, so no
+extraction step is needed. They are copied to `data/icons_mods/` and follow
+the same `Item_` prefix convention as vanilla.
+
+**Rules, in order:**
+1. Look in `data/icons_mods/`, **ignoring case**. Mods are usually authored
+   on Windows, where `Item_Foo.png` and `item_foo.png` are the same file; the
+   server is Linux, which tells them apart.
+2. If not found, look in the **vanilla icon index**: many mods reference
+   base-game icons without shipping them.
+3. `Icon = na` (also `none`/`null`) is a marker some authors use for "no
+   icon" and is treated as having no icon, not as a missing file.
+
+**Result:** 4,540 items with the mod's own icon, 300 reusing a vanilla icon,
+1,310 with no icon (field missing or `na`), 355 with an icon name but no file.
+
+**The 355 are accepted for now.** Likely causes (not verified): icons inside
+mod `.pack` files, or in subfolders the copy step does not read.
+`extract_packs.py` already understands the format, so this is an extension,
+not new work from scratch.
+
+---
+
+## Mod translations (`tools/extract_translations_mods.py`)
+
+**Decision:** read mod item names only for the **same languages already
+supported for vanilla**; any other language a mod ships is ignored on
+purpose.
+
+**Why a generic search:** the folder layout differs a lot between mods
+(`media/lua/shared/Translate/`, `media/shared/Translate/` without `lua`,
+all-lowercase `translate/es/itemname.json`, the same translations repeated
+in several version folders). Instead of assuming a path, the script finds any
+folder named `Translate` (case-insensitive) and any `ItemName.json` inside it
+(case-insensitive), and merges what it finds.
+
+**Result:** 19 mods have translations in the supported languages, covering
+3,125 items.
+
+**Known gap:** mods that keep their names in older `.txt` translation files
+are not read.
+
+---
+
+## Vanilla icons come from a client install, not from the server
+
+**Finding:** the dedicated server (LinuxGSM) has the game scripts and the
+vanilla translations, but **not** `UI2.pack` or the other texture packs
+(only the mods' `.pack` files are present). A headless server does not need
+UI textures.
+
+**Decision:** generate the vanilla icons on a full client install and copy
+`data/icons/`, `data/icon_index.json` and `data/items.json` to the server
+(done with WinSCP). The mod data is generated on the server itself.
+
+---
+
+## Where the bot lives on the server
+
+**Decision:** its own folder in the user's home directory, outside
+`serverfiles/` and `Zomboid/`.
+
+**Why:** LinuxGSM manages those two folders and may overwrite them on game
+updates. A project placed inside could be lost without warning.
+
+---
+
 ## Bot scope: two separate commands
 
 **Decision:** `/getid` returns only the ID; `/getinfo` returns the full card
@@ -127,12 +227,35 @@ ID).
 
 ---
 
-## Multiple matches in a search
+## Search behaviour
 
-**Decision:** when a search matches several items (e.g. "Trousers"), the
-bot shows a dropdown menu (`discord.ui.Select`) for the user to choose from,
-instead of automatically picking one or asking the user to be more
-specific.
+**Search by name, not by ID.** The bot matches the display name, its
+translations, and the mod's name. It never matches the internal ID. Many
+items have an ID that looks nothing like their name (a vehicle part's ID
+starts with the vehicle code, its name says "Hood"), and players think in
+names. This was clarified during testing because it was easy to assume the
+opposite.
+
+**Multiple matches:** when a search matches several items (e.g. "Trousers"),
+the bot shows a dropdown (`discord.ui.Select`) for the user to choose from,
+instead of automatically picking one or asking the user to be more specific.
+
+**Improvements made after testing with mods:**
+- Mods produce many near-identical names (a single vehicle mod has dozens of
+  parts containing the same model name). Matching a literal phrase was too
+  strict, so now **every word** of the query must appear, in any order, in
+  the item's names or in its mod name.
+- Discord limits a dropdown to 25 options. Results are now **sorted
+  alphabetically** and the message says how many matched in total when there
+  are more than 25, so the user knows to add words instead of silently
+  missing items.
+
+**Public result after choosing:** the dropdown is an ephemeral message
+(visible only to who ran the command) to avoid cluttering the channel. The
+first version edited that message with the result, so the result was private
+too, and it looked like "mod items are private" because mods more often fall
+into the multiple-match path. The chosen item is now sent as a **new public
+message**.
 
 ---
 
@@ -142,9 +265,28 @@ specific.
   `parse_recipes.py`, which would allow showing how an item is crafted. It
   was decided not to include this in the first version — the bot only
   reports on the item itself. Noted as a possible future feature.
-- **Steam Workshop mod items:** the design already accounts for a `_source`
-  field per item (currently always `"vanilla"`) so the parser could later be
-  extended to also read mod folders installed on IBEROZOID_Server, but that
-  extension hasn't been implemented yet — it requires looking at the real
-  folder structure of an actual mod to design it properly, rather than
-  guessing.
+- **Remaining mod icons (355 items):** see "Mod icons" above.
+- **Mod translations in older `.txt` formats:** see "Mod translations"
+  above.
+- **Keeping the bot running 24/7** (systemd service vs screen/tmux): not
+  decided or set up yet. Currently the bot is started by hand from an SSH
+  session.
+- **Automatic regeneration of `data/`** when the game or the mod list
+  changes: still a manual process.
+
+---
+
+## What is (and is not) in the repository
+
+**Not versioned:** `venv/`, `.env`, everything generated in `data/`
+(vanilla and mod JSON files, icon folders), local copies of game assets
+(`.pack` files, copyrighted), and editor files (`.vscode/`,
+`*.code-workspace`).
+
+**Why the generated data is excluded:** it is derived and can be recreated by
+running the scripts in `tools/` (see the README). The repository holds the
+recipe, not the output. The icons also come from copyrighted game files.
+
+**Consequence:** a fresh clone has no `data/` and no `.env`; the bot will
+not start until both are created (a missing `.env` shows up as
+`expected token to be a str, received NoneType`).
