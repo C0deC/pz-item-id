@@ -13,6 +13,8 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
   Se leen todos los .json y .txt de cada carpeta de idioma, sin asumir el
   nombre del archivo.
 - Idiomas: inglés (nombre principal) y los mismos 10 soportados para items.
+- Se excluyen las variantes no funcionales (coches quemados o destruidos),
+  detectadas por el sufijo de su nombre de script.
 
 Uso:
     python tools/parse_vehicles.py <media_vanilla> <workshop_content_108600> <salida.json>
@@ -29,6 +31,10 @@ NOMBRE_RE = re.compile(r'^\s*"?IGUI_VehicleName([A-Za-z0-9_]+)"?\s*[=:]\s*"?(.*?
 VERSION_DIR_RE = re.compile(r"^\d+(\.\d+)*$")
 
 IDIOMAS = {"EN", "ES", "ES_CL", "ES_MX", "FR", "DE", "IT", "PT", "RU", "PL", "NL"}
+
+# Variantes no funcionales (coches quemados o destruidos): no se pueden
+# conducir, así que no se incluyen en la lista.
+SUFIJOS_NO_FUNCIONALES = ("Burnt", "SmashedFront", "SmashedRear", "SmashedLeft", "SmashedRight")
 
 
 def quitar_comentarios(texto):
@@ -185,7 +191,6 @@ def main():
     ruta_salida = Path(sys.argv[3])
 
     todos = procesar_vanilla(carpeta_media)
-    n_vanilla = len(todos)
 
     mods_con_vehiculos = 0
     for carpeta_workshop in sorted(p for p in carpeta_content.iterdir() if p.is_dir()):
@@ -209,16 +214,23 @@ def main():
         unicos.append(v)
     duplicados = len(todos) - len(unicos)
 
+    # Se descartan las variantes no funcionales (quemados / destruidos).
+    antes = len(unicos)
+    unicos = [v for v in unicos if not v["_name"].endswith(SUFIJOS_NO_FUNCIONALES)]
+    excluidos = antes - len(unicos)
+
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
     with open(ruta_salida, "w", encoding="utf-8") as f:
         json.dump(unicos, f, indent=2, ensure_ascii=False)
 
+    n_vanilla = sum(1 for v in unicos if v["_source"] == "vanilla")
     sin_nombre = [v for v in unicos if not v["DisplayName"]]
     posibles_plantillas = [v for v in unicos if "template" in v["_name"].lower()]
 
     print(f"Vehículos vanilla: {n_vanilla}")
     print(f"Mods con vehículos: {mods_con_vehiculos}")
     print(f"Total de vehículos únicos: {len(unicos)} ({duplicados} duplicados descartados)")
+    print(f"Excluidos por no funcionales: {excluidos}")
     print(f"Con nombre en inglés: {len(unicos) - len(sin_nombre)}")
     print(f"Sin nombre en inglés: {len(sin_nombre)}")
     print("  Ejemplos sin nombre:", [v["_full_id"] for v in sin_nombre[:8]])

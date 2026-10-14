@@ -10,23 +10,30 @@ from PIL import Image
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+
 # --- Carga de datos: vanilla + mods ---------------------------------------
 
-with open("data/items.json", encoding="utf-8") as f:
-    items_vanilla = json.load(f)
+def cargar_json(ruta, obligatorio=True):
+    if not os.path.exists(ruta):
+        if obligatorio:
+            raise FileNotFoundError(f"Falta {ruta}")
+        print(f"AVISO: no existe {ruta}, se continúa sin esos datos")
+        return []
+    with open(ruta, encoding="utf-8") as f:
+        return json.load(f)
 
-with open("data/items_mods.json", encoding="utf-8") as f:
-    items_mods = json.load(f)
 
+items_vanilla = cargar_json("data/items.json")
+items_mods = cargar_json("data/items_mods.json")
 ITEMS = items_vanilla + items_mods
 
-with open("data/translations.json", encoding="utf-8") as f:
-    traducciones_vanilla = json.load(f)
+# Los vehículos son opcionales: si falta el archivo, el bot arranca igual.
+VEHICULOS = cargar_json("data/vehicles.json", obligatorio=False)
 
-with open("data/translations_mods.json", encoding="utf-8") as f:
-    traducciones_mods = json.load(f)
-
-TRADUCCIONES = {**traducciones_vanilla, **traducciones_mods}
+TRADUCCIONES = {
+    **cargar_json("data/translations.json"),
+    **cargar_json("data/translations_mods.json"),
+}
 
 
 def primero(valor):
@@ -38,6 +45,11 @@ def nombre_mostrado(item):
     return item.get("DisplayName") or item.get("_name")
 
 
+def nombre_vehiculo(vehiculo):
+    """Nombre legible del vehículo; si no tiene, el nombre del script."""
+    return vehiculo.get("DisplayName") or vehiculo["_name"]
+
+
 def limpiar_tipo(item):
     tipo = primero(item.get("ItemType", "?"))
     if isinstance(tipo, str):
@@ -47,68 +59,72 @@ def limpiar_tipo(item):
 
 # --- Nombres de búsqueda (inglés + traducciones) --------------------------
 
-def calcular_nombres_busqueda(item):
-    """Devuelve todos los nombres por los que se puede encontrar este item:
-    el nombre mostrado (inglés) más todas sus traducciones disponibles."""
+def nombres_item(item):
     nombres = {nombre_mostrado(item)}
-    traducciones_item = TRADUCCIONES.get(item["_full_id"], {})
-    nombres.update(traducciones_item.values())
+    nombres.update(TRADUCCIONES.get(item["_full_id"], {}).values())
+    return list(nombres)
+
+
+def nombres_vehiculo(vehiculo):
+    nombres = {nombre_vehiculo(vehiculo)}
+    nombres.update(vehiculo.get("_translations", {}).values())
+    if not vehiculo.get("DisplayName"):
+        nombres.add(vehiculo["_name"])  # sin nombre legible, se busca por el del script
     return list(nombres)
 
 
 # Precalculado una sola vez al arrancar, para no repetirlo en cada búsqueda.
-NOMBRES_POR_ITEM = {item["_full_id"]: calcular_nombres_busqueda(item) for item in ITEMS}
-
-# Lista aplanada (nombre, item) para las sugerencias por similitud.
-NOMBRES_APLANADOS = [
-    (nombre, item)
-    for item in ITEMS
-    for nombre in NOMBRES_POR_ITEM[item["_full_id"]]
-]
+NOMBRES_ITEMS = {it["_full_id"]: nombres_item(it) for it in ITEMS}
+NOMBRES_VEHICULOS = {v["_full_id"]: nombres_vehiculo(v) for v in VEHICULOS}
 
 
 # --- Búsqueda ------------------------------------------------------------
 
-def buscar_items(consulta):
-    """Devuelve una lista de items que coinciden con la consulta, mirando
-    tanto el nombre en inglés como sus traducciones:
-    1. Coincidencia exacta (ignorando mayúsculas) -> una sola opción.
-    2. Coincidencia parcial (el texto está contenido en algún nombre) -> puede haber varias.
+def buscar(consulta, lista, nombres_por_id):
+    """Devuelve (resultados, total) buscando en `lista`:
+    1. Coincidencia exacta con algún nombre -> una sola opción.
+    2. Todas las palabras de la consulta aparecen (en cualquier orden) en
+       los nombres o en el nombre del mod.
     3. Si no hay nada, sugerencias por similitud con difflib."""
     consulta_normalizada = consulta.strip().lower()
+    palabras = consulta_normalizada.split()
 
     exactos = [
-        item for item in ITEMS
-        if any(n.lower() == consulta_normalizada for n in NOMBRES_POR_ITEM[item["_full_id"]])
+        it for it in lista
+        if any(n.lower() == consulta_normalizada for n in nombres_por_id[it["_full_id"]])
     ]
     if exactos:
-        return exactos[:1]
+        return exactos[:1], 1
 
-    parciales = [
-        item for item in ITEMS
-        if any(consulta_normalizada in n.lower() for n in NOMBRES_POR_ITEM[item["_full_id"]])
-    ]
+    def coincide(it):
+        texto = " ".join(nombres_por_id[it["_full_id"]]).lower()
+        texto += " " + str(it.get("_source_name") or it.get("_source", "")).lower()
+        return all(p in texto for p in palabras)
+
+    parciales = sorted(
+        (it for it in lista if coincide(it)),
+        key=lambda it: nombres_por_id[it["_full_id"]][0].lower(),
+    )
     if parciales:
-        return parciales[:25]  # Discord permite máximo 25 opciones en un Select
+        return parciales[:25], len(parciales)  # Discord permite máximo 25 opciones en un Select
 
-    todos_los_nombres = [n for n, _ in NOMBRES_APLANADOS]
-    similares = difflib.get_close_matches(consulta, todos_los_nombres, n=5, cutoff=0.5)
+    aplanados = [(n, it) for it in lista for n in nombres_por_id[it["_full_id"]]]
+    similares = difflib.get_close_matches(consulta, [n for n, _ in aplanados], n=5, cutoff=0.5)
 
-    items_sugeridos = []
+    sugeridos = []
     vistos = set()
-    for nombre, item in NOMBRES_APLANADOS:
-        if nombre in similares and item["_full_id"] not in vistos:
-            items_sugeridos.append(item)
-            vistos.add(item["_full_id"])
-    return items_sugeridos
+    for nombre, it in aplanados:
+        if nombre in similares and it["_full_id"] not in vistos:
+            sugeridos.append(it)
+            vistos.add(it["_full_id"])
+    return sugeridos, len(sugeridos)
 
 
 # --- Iconos: vanilla + mods -------------------------------------------
 
 def ruta_icono(item):
-    """Devuelve la ruta del icono del item, buscando primero en los
-    iconos vanilla (data/icons/) y, si no está ahí, en los de mods
-    (data/icons_mods/), o None si no hay icono en ningún sitio."""
+    """Busca el icono primero en los vanilla (data/icons/) y, si no está,
+    en los de mods (data/icons_mods/). Devuelve None si no hay ninguno."""
     if not item.get("_icon_file"):
         return None
     ruta_vanilla = f"data/icons/{item['_icon_file']}"
@@ -121,9 +137,8 @@ def ruta_icono(item):
 
 
 def reescalar_icono(ruta_icono_archivo, factor=4):
-    """Amplía un icono x`factor` usando NEAREST para mantener el pixel art
-    nítido (sin difuminar), y lo devuelve como bytes en memoria (sin
-    escribir nada a disco)."""
+    """Amplía un icono x`factor` con NEAREST para mantener el pixel art
+    nítido, y lo devuelve como bytes en memoria."""
     with Image.open(ruta_icono_archivo) as img:
         nuevo_tamano = (img.width * factor, img.height * factor)
         img_grande = img.resize(nuevo_tamano, Image.NEAREST)
@@ -133,14 +148,18 @@ def reescalar_icono(ruta_icono_archivo, factor=4):
         return buffer
 
 
-# --- Construcción del embed para /getinfo --------------------------------
+# --- Embeds -----------------------------------------------------------
+
+def origen(elemento):
+    return elemento.get("_source_name") or elemento.get("_source", "vanilla")
+
 
 def construir_embed(item):
     embed = discord.Embed(title=nombre_mostrado(item), color=discord.Color.dark_grey())
     embed.add_field(name="ID", value=f"`{item['_full_id']}`", inline=True)
     embed.add_field(name="Tipo", value=str(limpiar_tipo(item)), inline=True)
     embed.add_field(name="Categoría", value=str(primero(item.get("DisplayCategory", "?"))), inline=True)
-    embed.add_field(name="Origen", value=item.get("_source_name") or item.get("_source", "vanilla"), inline=True)
+    embed.add_field(name="Origen", value=origen(item), inline=True)
 
     archivo = None
     ruta = ruta_icono(item)
@@ -152,66 +171,80 @@ def construir_embed(item):
     return embed, archivo
 
 
+def construir_embed_vehiculo(vehiculo):
+    embed = discord.Embed(title=nombre_vehiculo(vehiculo), color=discord.Color.dark_grey())
+    embed.add_field(name="ID", value=f"`{vehiculo['_full_id']}`", inline=True)
+    embed.add_field(name="Origen", value=origen(vehiculo), inline=True)
+    return embed
+
+
+async def enviar_resultado(interaction: discord.Interaction, elemento, modo: str):
+    """Envía el resultado final como mensaje público (no efímero)."""
+    if modo == "id":
+        await interaction.response.send_message(f"`{elemento['_full_id']}`")
+    elif modo == "vehiculo":
+        await interaction.response.send_message(embed=construir_embed_vehiculo(elemento))
+    else:
+        embed, archivo = construir_embed(elemento)
+        if archivo:
+            await interaction.response.send_message(embed=embed, file=archivo)
+        else:
+            await interaction.response.send_message(embed=embed)
+
+
 # --- Menú de selección cuando hay varias coincidencias --------------------
 
-class SelectorItems(discord.ui.View):
-    def __init__(self, items, modo):
+class Selector(discord.ui.View):
+    def __init__(self, elementos, modo, etiqueta):
         super().__init__(timeout=60)
-        self.items = items
-        self.modo = modo  # "id" o "info"
+        self.elementos = elementos
+        self.modo = modo  # "id", "info" o "vehiculo"
 
+        # Se añade el ID como descripción porque varios elementos pueden
+        # tener el mismo nombre (por ejemplo, las puertas delantera y trasera).
         opciones = [
-            discord.SelectOption(label=nombre_mostrado(it)[:100], value=str(i))
-            for i, it in enumerate(items)
+            discord.SelectOption(
+                label=etiqueta(el)[:100],
+                description=el["_full_id"][:100],
+                value=str(i),
+            )
+            for i, el in enumerate(elementos)
         ]
-        select = discord.ui.Select(placeholder="Elige un item...", options=opciones)
+        select = discord.ui.Select(placeholder="Elige una opción...", options=opciones)
         select.callback = self.al_seleccionar
         self.add_item(select)
 
     async def al_seleccionar(self, interaction: discord.Interaction):
-        indice = int(interaction.data["values"][0])
-        item = self.items[indice]
-
-        # Mensaje nuevo y público (no edita el menú efímero original),
-        # para que el resultado se vea igual de visible que una
-        # coincidencia única, tanto para items vanilla como de mods.
-        if self.modo == "id":
-            await interaction.response.send_message(f"`{item['_full_id']}`")
-        else:
-            embed, archivo = construir_embed(item)
-            if archivo:
-                await interaction.response.send_message(embed=embed, file=archivo)
-            else:
-                await interaction.response.send_message(embed=embed)
+        elemento = self.elementos[int(interaction.data["values"][0])]
+        await enviar_resultado(interaction, elemento, self.modo)
 
 
-# --- Lógica compartida entre /getid y /getinfo ----------------------------
+# --- Lógica compartida por los tres comandos ------------------------------
 
 async def manejar_busqueda(interaction: discord.Interaction, nombre: str, modo: str):
-    resultados = buscar_items(nombre)
+    if modo == "vehiculo":
+        lista, nombres, etiqueta = VEHICULOS, NOMBRES_VEHICULOS, nombre_vehiculo
+    else:
+        lista, nombres, etiqueta = ITEMS, NOMBRES_ITEMS, nombre_mostrado
+
+    resultados, total = buscar(nombre, lista, nombres)
 
     if not resultados:
         await interaction.response.send_message(
-            f"No he encontrado ningún item parecido a **{nombre}**.", ephemeral=True
+            f"No he encontrado nada parecido a **{nombre}**.", ephemeral=True
         )
         return
 
     if len(resultados) == 1:
-        item = resultados[0]
-        if modo == "id":
-            await interaction.response.send_message(f"`{item['_full_id']}`")
-        else:
-            embed, archivo = construir_embed(item)
-            if archivo:
-                await interaction.response.send_message(embed=embed, file=archivo)
-            else:
-                await interaction.response.send_message(embed=embed)
+        await enviar_resultado(interaction, resultados[0], modo)
         return
 
-    vista = SelectorItems(resultados, modo)
+    aviso = ""
+    if total > len(resultados):
+        aviso = f" (mostrando los {len(resultados)} primeros; añade más palabras para afinar)"
     await interaction.response.send_message(
-        f"He encontrado {len(resultados)} items que coinciden con **{nombre}**. Elige uno:",
-        view=vista,
+        f"He encontrado {total} resultados para **{nombre}**{aviso}. Elige uno:",
+        view=Selector(resultados, modo, etiqueta),
         ephemeral=True,
     )
 
@@ -227,7 +260,8 @@ tree = app_commands.CommandTree(client)
 async def on_ready():
     await tree.sync()
     print(f"✅ Conectado como {client.user} (ID: {client.user.id})")
-    print(f"   {len(ITEMS)} items cargados ({len(items_vanilla)} vanilla + {len(items_mods)} de mods)")
+    print(f"   {len(ITEMS)} items ({len(items_vanilla)} vanilla + {len(items_mods)} de mods)")
+    print(f"   {len(VEHICULOS)} vehículos")
 
 
 @tree.command(name="getid", description="Devuelve el ID de un item de Project Zomboid")
@@ -240,6 +274,12 @@ async def getid(interaction: discord.Interaction, nombre: str):
 @app_commands.describe(nombre="Nombre del item a buscar (en cualquier idioma soportado)")
 async def getinfo(interaction: discord.Interaction, nombre: str):
     await manejar_busqueda(interaction, nombre, "info")
+
+
+@tree.command(name="getvehicle", description="Devuelve el ID de un vehículo de Project Zomboid")
+@app_commands.describe(nombre="Nombre del vehículo a buscar (en cualquier idioma soportado)")
+async def getvehicle(interaction: discord.Interaction, nombre: str):
+    await manejar_busqueda(interaction, nombre, "vehiculo")
 
 
 client.run(TOKEN)
