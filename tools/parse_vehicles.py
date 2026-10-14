@@ -17,8 +17,12 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
   maxSpeed y seats, leídas SOLO del nivel superior del vehículo (se ignoran
   los bloques anidados: model, skin, wheel, part...). Son valores internos
   del juego, sin unidades reales.
-- Se excluyen las variantes no funcionales (coches quemados o destruidos),
-  detectadas por el sufijo de su nombre de script.
+- Imagen: para los vehículos de mods se copia el preview.png del mod (el
+  indicado en 'poster=' de mod.info) a data/vehicle_previews/, reducido a
+  un máximo de 512 px. Es la portada del mod, no una foto de cada vehículo.
+  Los vehículos vanilla no tienen imagen.
+- Se excluyen las variantes no funcionales (coches quemados o destruidos):
+  cualquier nombre de script que contenga "burnt" o "smashed".
 
 Uso:
     python tools/parse_vehicles.py <media_vanilla> <workshop_content_108600> <salida.json>
@@ -29,6 +33,8 @@ import re
 import sys
 from pathlib import Path
 
+from PIL import Image
+
 VEHICLE_RE = re.compile(r"^[ \t]*vehicle[ \t]+([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
 MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
 NOMBRE_RE = re.compile(r'^\s*"?IGUI_VehicleName([A-Za-z0-9_]+)"?\s*[=:]\s*"?(.*?)"?\s*,?\s*$')
@@ -37,11 +43,22 @@ VERSION_DIR_RE = re.compile(r"^\d+(\.\d+)*$")
 IDIOMAS = {"EN", "ES", "ES_CL", "ES_MX", "FR", "DE", "IT", "PT", "RU", "PL", "NL"}
 
 # Variantes no funcionales (coches quemados o destruidos): no se pueden
-# conducir, así que no se incluyen en la lista.
-SUFIJOS_NO_FUNCIONALES = ("Burnt", "SmashedFront", "SmashedRear", "SmashedLeft", "SmashedRight")
+# conducir, así que no se incluyen. Se busca en cualquier parte del nombre,
+# sin distinguir mayúsculas (ej. NormalCarBurntPolice).
+MARCAS_NO_FUNCIONALES = ("burnt", "smashed")
+
+# Solo para el diagnóstico final: sufijos que ya excluía la versión anterior.
+SUFIJOS_ANTIGUOS = ("Burnt", "SmashedFront", "SmashedRear", "SmashedLeft", "SmashedRight")
 
 # Propiedades del nivel superior del vehículo que se guardan en "stats".
 CAMPOS_ESTADISTICAS = ("mass", "engineForce", "engineQuality", "engineLoudness", "maxSpeed", "seats")
+
+TAMANO_MAX_PREVIEW = 512
+
+
+def es_no_funcional(nombre):
+    n = nombre.lower()
+    return any(marca in n for marca in MARCAS_NO_FUNCIONALES)
 
 
 def quitar_comentarios(texto):
@@ -165,6 +182,36 @@ def leer_mod_info(ruta):
     return info
 
 
+def copiar_preview(carpeta_mod, carpeta_version, carpeta_common, poster, carpeta_previews):
+    """Copia el preview del mod a carpeta_previews, reducido, y devuelve el
+    nombre del archivo creado (o None si no se encuentra o no se puede leer).
+    El nombre lleva el ID de Workshop para que no choque entre mods."""
+    nombre = f"{carpeta_mod.parent.parent.name}_{carpeta_mod.name}"
+    nombre = re.sub(r"[^A-Za-z0-9_.-]", "_", nombre) + ".png"
+    destino = carpeta_previews / nombre
+    if destino.exists():
+        return nombre
+
+    posters = [poster] if poster == "preview.png" else [poster, "preview.png"]
+    for base in (carpeta_version, carpeta_mod, carpeta_common):
+        if not base:
+            continue
+        for p in posters:
+            origen = base / p
+            if not origen.is_file():
+                continue
+            try:
+                with Image.open(origen) as img:
+                    img = img.convert("RGBA")
+                    img.thumbnail((TAMANO_MAX_PREVIEW, TAMANO_MAX_PREVIEW))
+                    carpeta_previews.mkdir(parents=True, exist_ok=True)
+                    img.save(destino, "PNG")
+                return nombre
+            except Exception:
+                continue
+    return None
+
+
 def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
     entradas = []
     for modulo, nombre_script, props in pares:
@@ -184,6 +231,7 @@ def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
             "_source": origen,
             "_source_name": nombre_origen,
             "_source_file": archivo,
+            "_preview": None,
             "DisplayName": por_idioma.get("EN"),
             "_translations": {i: n for i, n in por_idioma.items() if i != "EN"},
             "stats": stats,
@@ -200,22 +248,24 @@ def procesar_vanilla(carpeta_media):
     return entradas
 
 
-def procesar_mod(carpeta_mod):
+def procesar_mod(carpeta_mod, carpeta_previews):
     carpeta_version = elegir_carpeta_version(carpeta_mod)
     carpeta_common = carpeta_mod / "common"
+    carpeta_common = carpeta_common if carpeta_common.exists() else None
 
     # Carpetas donde buscar scripts: la versión más reciente y common/.
     # Si el mod no tiene ninguna, se usa la propia carpeta del mod.
-    raices = [d for d in (carpeta_version, carpeta_common) if d and d.exists()]
+    raices = [d for d in (carpeta_version, carpeta_common) if d]
     if not raices:
         raices = [carpeta_mod]
 
-    nombre_mod = carpeta_mod.name
+    info = {}
     for candidata in [carpeta_version, carpeta_mod]:
         if candidata and (candidata / "mod.info").exists():
             info = leer_mod_info(candidata / "mod.info")
-            nombre_mod = info.get("name", nombre_mod)
             break
+    nombre_mod = info.get("name", carpeta_mod.name)
+    poster = info.get("poster", "preview.png")
 
     nombres = leer_nombres(carpeta_mod)
 
@@ -227,6 +277,11 @@ def procesar_mod(carpeta_mod):
         for archivo in sorted(carpeta_scripts.rglob("*.txt")):
             pares = vehiculos_de_archivo(archivo)
             entradas.extend(construir_entradas(pares, nombres, carpeta_mod.name, nombre_mod, archivo.name))
+
+    if entradas:
+        preview = copiar_preview(carpeta_mod, carpeta_version, carpeta_common, poster, carpeta_previews)
+        for e in entradas:
+            e["_preview"] = preview
     return entradas
 
 
@@ -238,6 +293,7 @@ def main():
     carpeta_media = Path(sys.argv[1])
     carpeta_content = Path(sys.argv[2])
     ruta_salida = Path(sys.argv[3])
+    carpeta_previews = ruta_salida.parent / "vehicle_previews"
 
     todos = procesar_vanilla(carpeta_media)
 
@@ -247,7 +303,7 @@ def main():
         if not carpeta_mods.exists():
             continue
         for carpeta_mod in sorted(p for p in carpeta_mods.iterdir() if p.is_dir()):
-            entradas = procesar_mod(carpeta_mod)
+            entradas = procesar_mod(carpeta_mod, carpeta_previews)
             if entradas:
                 mods_con_vehiculos += 1
                 todos.extend(entradas)
@@ -264,9 +320,11 @@ def main():
     duplicados = len(todos) - len(unicos)
 
     # Se descartan las variantes no funcionales (quemados / destruidos).
-    antes = len(unicos)
-    unicos = [v for v in unicos if not v["_name"].endswith(SUFIJOS_NO_FUNCIONALES)]
-    excluidos = antes - len(unicos)
+    excluidos_lista = [v for v in unicos if es_no_funcional(v["_name"])]
+    unicos = [v for v in unicos if not es_no_funcional(v["_name"])]
+    solo_regla_ampliada = [
+        v["_full_id"] for v in excluidos_lista if not v["_name"].endswith(SUFIJOS_ANTIGUOS)
+    ]
 
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
     with open(ruta_salida, "w", encoding="utf-8") as f:
@@ -276,11 +334,15 @@ def main():
     sin_nombre = [v for v in unicos if not v["DisplayName"]]
     posibles_plantillas = [v for v in unicos if "template" in v["_name"].lower()]
     sin_motor = [v for v in unicos if "engineForce" not in v["stats"]]
+    de_mods = [v for v in unicos if v["_source"] != "vanilla"]
+    con_preview = [v for v in de_mods if v["_preview"]]
 
     print(f"Vehículos vanilla: {n_vanilla}")
     print(f"Mods con vehículos: {mods_con_vehiculos}")
     print(f"Total de vehículos únicos: {len(unicos)} ({duplicados} duplicados descartados)")
-    print(f"Excluidos por no funcionales: {excluidos}")
+    print(f"Excluidos por no funcionales: {len(excluidos_lista)}")
+    print(f"  Excluidos solo por la regla ampliada: {len(solo_regla_ampliada)}")
+    print("  Ejemplos:", solo_regla_ampliada[:15])
     print(f"Con nombre en inglés: {len(unicos) - len(sin_nombre)}")
     print(f"Sin nombre en inglés: {len(sin_nombre)}")
     print(f"Nombres que contienen 'template': {len(posibles_plantillas)}")
@@ -290,6 +352,7 @@ def main():
         print(f"  {campo}: {n} de {len(unicos)}")
     print(f"Sin engineForce: {len(sin_motor)}")
     print("  Ejemplos:", [(v["_full_id"], v["_source_file"]) for v in sin_motor[:6]])
+    print(f"Vehículos de mods con imagen de preview: {len(con_preview)} de {len(de_mods)}")
     print(f"Guardado: {ruta_salida}")
 
 
