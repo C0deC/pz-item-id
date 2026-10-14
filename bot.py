@@ -1,312 +1,360 @@
-import os
-import io
+"""
+Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
+único data/vehicles.json.
+
+- ID: Módulo.NombreDelScript (ej. Base.70barracuda), a partir de los
+  bloques `vehicle Nombre { ... }` de media/scripts. Los bloques
+  `template vehicle ...` no empiezan la línea por "vehicle", así que se
+  ignoran (son plantillas, no vehículos que se puedan generar).
+- Nombre legible: no está en el script, sino en las traducciones, con la
+  clave IGUI_VehicleName<NombreDelScript>. Se aceptan dos formatos:
+      JSON:  "IGUI_VehicleNameCarLights": "Chevalier Nyala",
+      TXT:   IGUI_VehicleNameCarLights = "Chevalier Nyala"
+  Se leen todos los .json y .txt de cada carpeta de idioma, sin asumir el
+  nombre del archivo.
+- Idiomas: inglés (nombre principal) y los mismos 10 soportados para items.
+- Estadísticas ("stats"): mass, engineForce, engineQuality, engineLoudness,
+  maxSpeed y seats, leídas SOLO del nivel superior del vehículo (se ignoran
+  los bloques anidados: model, skin, wheel, part...). Son valores internos
+  del juego, sin unidades reales.
+- Imagen: para los vehículos de mods se copia el preview.png del mod (el
+  indicado en 'poster=' de mod.info) a data/vehicle_previews/, reducido a
+  un máximo de 512 px. Es la portada del mod, no una foto de cada vehículo.
+  Los vehículos vanilla no tienen imagen.
+- Se excluyen las variantes no funcionales (coches quemados o destruidos):
+  cualquier nombre de script que contenga "burnt" o "smashed".
+
+Uso:
+    python tools/parse_vehicles.py <media_vanilla> <workshop_content_108600> <salida.json>
+"""
+
 import json
-import difflib
-import discord
-from discord import app_commands
-from dotenv import load_dotenv
+import re
+import sys
+from pathlib import Path
+
 from PIL import Image
 
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+VEHICLE_RE = re.compile(r"^[ \t]*vehicle[ \t]+([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
+MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
+NOMBRE_RE = re.compile(r'^\s*"?IGUI_VehicleName([A-Za-z0-9_]+)"?\s*[=:]\s*"?(.*?)"?\s*,?\s*$')
+VERSION_DIR_RE = re.compile(r"^\d+(\.\d+)*$")
+
+IDIOMAS = {"EN", "ES", "ES_CL", "ES_MX", "FR", "DE", "IT", "PT", "RU", "PL", "NL"}
+
+# Variantes no funcionales (coches quemados o destruidos): no se pueden
+# conducir, así que no se incluyen. Se busca en cualquier parte del nombre,
+# sin distinguir mayúsculas (ej. NormalCarBurntPolice).
+MARCAS_NO_FUNCIONALES = ("burnt", "smashed")
+
+# Solo para el diagnóstico final: sufijos que ya excluía la versión anterior.
+SUFIJOS_ANTIGUOS = ("Burnt", "SmashedFront", "SmashedRear", "SmashedLeft", "SmashedRight")
+
+# Propiedades del nivel superior del vehículo que se guardan en "stats".
+CAMPOS_ESTADISTICAS = ("mass", "engineForce", "engineQuality", "engineLoudness", "maxSpeed", "seats")
+
+TAMANO_MAX_PREVIEW = 512
 
 
-# --- Carga de datos: vanilla + mods ---------------------------------------
-
-def cargar_json(ruta, obligatorio=True):
-    if not os.path.exists(ruta):
-        if obligatorio:
-            raise FileNotFoundError(f"Falta {ruta}")
-        print(f"AVISO: no existe {ruta}, se continúa sin esos datos")
-        return []
-    with open(ruta, encoding="utf-8") as f:
-        return json.load(f)
+def es_no_funcional(nombre):
+    n = nombre.lower()
+    return any(marca in n for marca in MARCAS_NO_FUNCIONALES)
 
 
-items_vanilla = cargar_json("data/items.json")
-items_mods = cargar_json("data/items_mods.json")
-ITEMS = items_vanilla + items_mods
-
-# Los vehículos son opcionales: si falta el archivo, el bot arranca igual.
-VEHICULOS = cargar_json("data/vehicles.json", obligatorio=False)
-
-TRADUCCIONES = {
-    **cargar_json("data/translations.json"),
-    **cargar_json("data/translations_mods.json"),
-}
+def quitar_comentarios(texto):
+    return "\n".join(linea.split("//")[0] for linea in texto.split("\n"))
 
 
-def primero(valor):
-    """Algunos campos pueden venir como lista si la clave se repetía en el script."""
-    return valor[0] if isinstance(valor, list) else valor
+def buscar_cierre(texto, indice_apertura):
+    """Devuelve el índice de la '}' que cierra la '{' dada, contando anidados."""
+    profundidad = 0
+    for i in range(indice_apertura, len(texto)):
+        if texto[i] == "{":
+            profundidad += 1
+        elif texto[i] == "}":
+            profundidad -= 1
+            if profundidad == 0:
+                return i
+    return -1
 
 
-def nombre_mostrado(item):
-    return item.get("DisplayName") or item.get("_name")
+def propiedades_nivel_superior(cuerpo):
+    """Devuelve {clave: valor} de las líneas 'clave = valor' que están
+    directamente dentro del vehículo, ignorando el contenido de los bloques
+    anidados (model, skin, wheel, part...)."""
+    texto = []
+    profundidad = 0
+    for c in cuerpo:
+        if c == "{":
+            profundidad += 1
+        elif c == "}":
+            profundidad -= 1
+        elif profundidad == 0:
+            texto.append(c)
+
+    props = {}
+    for linea in "".join(texto).split("\n"):
+        linea = linea.strip().rstrip(",").strip()
+        if "=" in linea:
+            clave, _, valor = linea.partition("=")
+            props[clave.strip()] = valor.strip()
+    return props
 
 
-def nombre_vehiculo(vehiculo):
-    """Nombre legible del vehículo; si no tiene, el nombre del script."""
-    return vehiculo.get("DisplayName") or vehiculo["_name"]
-
-
-def limpiar_tipo(item):
-    tipo = primero(item.get("ItemType", "?"))
-    if isinstance(tipo, str):
-        return tipo.replace("base:", "")
-    return tipo
-
-
-# --- Nombres de búsqueda (inglés + traducciones) --------------------------
-
-def nombres_item(item):
-    nombres = {nombre_mostrado(item)}
-    nombres.update(TRADUCCIONES.get(item["_full_id"], {}).values())
-    return list(nombres)
-
-
-def nombres_vehiculo(vehiculo):
-    nombres = {nombre_vehiculo(vehiculo)}
-    nombres.update(vehiculo.get("_translations", {}).values())
-    if not vehiculo.get("DisplayName"):
-        nombres.add(vehiculo["_name"])  # sin nombre legible, se busca por el del script
-    return list(nombres)
-
-
-# Precalculado una sola vez al arrancar, para no repetirlo en cada búsqueda.
-NOMBRES_ITEMS = {it["_full_id"]: nombres_item(it) for it in ITEMS}
-NOMBRES_VEHICULOS = {v["_full_id"]: nombres_vehiculo(v) for v in VEHICULOS}
-
-
-# --- Búsqueda ------------------------------------------------------------
-
-def buscar(consulta, lista, nombres_por_id):
-    """Devuelve (resultados, total) buscando en `lista`:
-    1. Coincidencia exacta con algún nombre -> una sola opción.
-    2. Todas las palabras de la consulta aparecen (en cualquier orden) en
-       los nombres o en el nombre del mod.
-    3. Si no hay nada, sugerencias por similitud con difflib."""
-    consulta_normalizada = consulta.strip().lower()
-    palabras = consulta_normalizada.split()
-
-    exactos = [
-        it for it in lista
-        if any(n.lower() == consulta_normalizada for n in nombres_por_id[it["_full_id"]])
-    ]
-    if exactos:
-        return exactos[:1], 1
-
-    def coincide(it):
-        texto = " ".join(nombres_por_id[it["_full_id"]]).lower()
-        texto += " " + str(it.get("_source_name") or it.get("_source", "")).lower()
-        return all(p in texto for p in palabras)
-
-    parciales = sorted(
-        (it for it in lista if coincide(it)),
-        key=lambda it: nombres_por_id[it["_full_id"]][0].lower(),
-    )
-    if parciales:
-        return parciales[:25], len(parciales)  # Discord permite máximo 25 opciones en un Select
-
-    aplanados = [(n, it) for it in lista for n in nombres_por_id[it["_full_id"]]]
-    similares = difflib.get_close_matches(consulta, [n for n, _ in aplanados], n=5, cutoff=0.5)
-
-    sugeridos = []
-    vistos = set()
-    for nombre, it in aplanados:
-        if nombre in similares and it["_full_id"] not in vistos:
-            sugeridos.append(it)
-            vistos.add(it["_full_id"])
-    return sugeridos, len(sugeridos)
-
-
-# --- Iconos: vanilla + mods -------------------------------------------
-
-def ruta_icono(item):
-    """Busca el icono primero en los vanilla (data/icons/) y, si no está,
-    en los de mods (data/icons_mods/). Devuelve None si no hay ninguno."""
-    if not item.get("_icon_file"):
+def a_numero(valor):
+    """Convierte '120.0' en 120 y '0.8' en 0.8. Devuelve None si no es un número."""
+    try:
+        n = float(valor.strip().rstrip("fF"))
+    except ValueError:
         return None
-    ruta_vanilla = f"data/icons/{item['_icon_file']}"
-    if os.path.exists(ruta_vanilla):
-        return ruta_vanilla
-    ruta_mod = f"data/icons_mods/{item['_icon_file']}"
-    if os.path.exists(ruta_mod):
-        return ruta_mod
+    return int(n) if n == int(n) else n
+
+
+def vehiculos_de_archivo(ruta):
+    """Devuelve una lista de (modulo, nombre_script, propiedades) de un archivo."""
+    texto = quitar_comentarios(ruta.read_text(encoding="utf-8", errors="replace"))
+    encontrados = []
+
+    for m_modulo in MODULE_RE.finditer(texto):
+        modulo = m_modulo.group(1)
+        abre = m_modulo.end() - 1
+        cierra = buscar_cierre(texto, abre)
+        if cierra < 0:
+            continue
+        cuerpo = texto[abre + 1:cierra]
+
+        pos = 0
+        while True:
+            m = VEHICLE_RE.search(cuerpo, pos)
+            if not m:
+                break
+            cierra_v = buscar_cierre(cuerpo, m.end() - 1)
+            if cierra_v < 0:
+                break
+            props = propiedades_nivel_superior(cuerpo[m.end():cierra_v])
+            encontrados.append((modulo, m.group(1), props))
+            pos = cierra_v + 1  # salta el contenido del vehículo (partes, modelos...)
+
+    return encontrados
+
+
+def leer_nombres(raiz):
+    """Busca cualquier carpeta 'Translate' (sin importar mayúsculas) bajo raiz
+    y devuelve {nombre_script: {IDIOMA: nombre}} con los IGUI_VehicleName."""
+    nombres = {}
+    if not raiz.exists():
+        return nombres
+
+    carpetas = sorted(p for p in raiz.rglob("*") if p.is_dir() and p.name.lower() == "translate")
+    for carpeta in carpetas:
+        for carpeta_idioma in sorted(carpeta.iterdir()):
+            if not carpeta_idioma.is_dir():
+                continue
+            idioma = carpeta_idioma.name.upper()
+            if idioma not in IDIOMAS:
+                continue
+            for archivo in sorted(carpeta_idioma.iterdir()):
+                if not archivo.is_file() or archivo.suffix.lower() not in (".json", ".txt"):
+                    continue
+                texto = archivo.read_text(encoding="utf-8-sig", errors="replace")
+                for linea in texto.splitlines():
+                    m = NOMBRE_RE.match(linea)
+                    if m:
+                        valor = m.group(2).replace('\\"', '"').strip()
+                        if valor:
+                            nombres.setdefault(m.group(1), {})[idioma] = valor
+    return nombres
+
+
+def elegir_carpeta_version(carpeta_mod):
+    candidatas = [d for d in carpeta_mod.iterdir() if d.is_dir() and VERSION_DIR_RE.match(d.name)]
+    if not candidatas:
+        return None
+    return max(candidatas, key=lambda d: tuple(int(p) for p in d.name.split(".")))
+
+
+def leer_mod_info(ruta):
+    info = {}
+    for linea in ruta.read_text(encoding="utf-8", errors="replace").split("\n"):
+        if "=" in linea:
+            clave, _, valor = linea.partition("=")
+            info[clave.strip()] = valor.strip().strip("'").strip('"')
+    return info
+
+
+def copiar_preview(carpeta_mod, carpeta_version, carpeta_common, poster, carpeta_previews):
+    """Copia el preview del mod a carpeta_previews, reducido, y devuelve el
+    nombre del archivo creado (o None si no se encuentra o no se puede leer).
+    El nombre lleva el ID de Workshop para que no choque entre mods."""
+    nombre = f"{carpeta_mod.parent.parent.name}_{carpeta_mod.name}"
+    nombre = re.sub(r"[^A-Za-z0-9_.-]", "_", nombre) + ".png"
+    destino = carpeta_previews / nombre
+    if destino.exists():
+        return nombre
+
+    posters = [poster] if poster == "preview.png" else [poster, "preview.png"]
+    for base in (carpeta_version, carpeta_mod, carpeta_common):
+        if not base:
+            continue
+        for p in posters:
+            origen = base / p
+            if not origen.is_file():
+                continue
+            try:
+                with Image.open(origen) as img:
+                    img = img.convert("RGBA")
+                    img.thumbnail((TAMANO_MAX_PREVIEW, TAMANO_MAX_PREVIEW))
+                    carpeta_previews.mkdir(parents=True, exist_ok=True)
+                    img.save(destino, "PNG")
+                return nombre
+            except Exception:
+                continue
     return None
 
 
-def reescalar_icono(ruta_icono_archivo, factor=4):
-    """Amplía un icono x`factor` con NEAREST para mantener el pixel art
-    nítido, y lo devuelve como bytes en memoria."""
-    with Image.open(ruta_icono_archivo) as img:
-        nuevo_tamano = (img.width * factor, img.height * factor)
-        img_grande = img.resize(nuevo_tamano, Image.NEAREST)
-        buffer = io.BytesIO()
-        img_grande.save(buffer, format="PNG")
-        buffer.seek(0)
-        return buffer
+def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
+    entradas = []
+    for modulo, nombre_script, props in pares:
+        por_idioma = nombres.get(nombre_script, {})
+
+        stats = {}
+        for campo in CAMPOS_ESTADISTICAS:
+            if campo in props:
+                numero = a_numero(props[campo])
+                if numero is not None:
+                    stats[campo] = numero
+
+        entradas.append({
+            "_name": nombre_script,
+            "_module": modulo,
+            "_full_id": f"{modulo}.{nombre_script}",
+            "_source": origen,
+            "_source_name": nombre_origen,
+            "_source_file": archivo,
+            "_preview": None,
+            "DisplayName": por_idioma.get("EN"),
+            "_translations": {i: n for i, n in por_idioma.items() if i != "EN"},
+            "stats": stats,
+        })
+    return entradas
 
 
-# --- Embeds -----------------------------------------------------------
-
-def origen(elemento):
-    return elemento.get("_source_name") or elemento.get("_source", "vanilla")
-
-
-def construir_embed(item):
-    embed = discord.Embed(title=nombre_mostrado(item), color=discord.Color.dark_grey())
-    embed.add_field(name="ID", value=f"`{item['_full_id']}`", inline=True)
-    embed.add_field(name="Tipo", value=str(limpiar_tipo(item)), inline=True)
-    embed.add_field(name="Categoría", value=str(primero(item.get("DisplayCategory", "?"))), inline=True)
-    embed.add_field(name="Origen", value=origen(item), inline=True)
-
-    archivo = None
-    ruta = ruta_icono(item)
-    if ruta:
-        buffer = reescalar_icono(ruta)
-        archivo = discord.File(buffer, filename=item["_icon_file"])
-        embed.set_image(url=f"attachment://{item['_icon_file']}")
-
-    return embed, archivo
+def procesar_vanilla(carpeta_media):
+    nombres = leer_nombres(carpeta_media / "lua" / "shared")
+    entradas = []
+    for archivo in sorted((carpeta_media / "scripts").rglob("*.txt")):
+        pares = vehiculos_de_archivo(archivo)
+        entradas.extend(construir_entradas(pares, nombres, "vanilla", None, archivo.name))
+    return entradas
 
 
-# Estadísticas de vehículo que se muestran, en este orden. Solo aparecen
-# las que el vehículo tenga definidas.
-ESTADISTICAS_VEHICULO = [
-    ("engineForce", "Fuerza del motor"),
-    ("maxSpeed", "Velocidad máx."),
-    ("mass", "Masa"),
-    ("seats", "Asientos"),
-    ("engineQuality", "Calidad del motor"),
-    ("engineLoudness", "Ruido del motor"),
-]
+def procesar_mod(carpeta_mod, carpeta_previews):
+    carpeta_version = elegir_carpeta_version(carpeta_mod)
+    carpeta_common = carpeta_mod / "common"
+    carpeta_common = carpeta_common if carpeta_common.exists() else None
+
+    # Carpetas donde buscar scripts: la versión más reciente y common/.
+    # Si el mod no tiene ninguna, se usa la propia carpeta del mod.
+    raices = [d for d in (carpeta_version, carpeta_common) if d]
+    if not raices:
+        raices = [carpeta_mod]
+
+    info = {}
+    for candidata in [carpeta_version, carpeta_mod]:
+        if candidata and (candidata / "mod.info").exists():
+            info = leer_mod_info(candidata / "mod.info")
+            break
+    nombre_mod = info.get("name", carpeta_mod.name)
+    poster = info.get("poster", "preview.png")
+
+    nombres = leer_nombres(carpeta_mod)
+
+    entradas = []
+    for raiz in raices:
+        carpeta_scripts = raiz / "media" / "scripts"
+        if not carpeta_scripts.exists():
+            continue
+        for archivo in sorted(carpeta_scripts.rglob("*.txt")):
+            pares = vehiculos_de_archivo(archivo)
+            entradas.extend(construir_entradas(pares, nombres, carpeta_mod.name, nombre_mod, archivo.name))
+
+    if entradas:
+        preview = copiar_preview(carpeta_mod, carpeta_version, carpeta_common, poster, carpeta_previews)
+        for e in entradas:
+            e["_preview"] = preview
+    return entradas
 
 
-def construir_embed_vehiculo(vehiculo):
-    embed = discord.Embed(title=nombre_vehiculo(vehiculo), color=discord.Color.dark_grey())
-    embed.add_field(name="ID", value=f"`{vehiculo['_full_id']}`", inline=True)
-    embed.add_field(name="Origen", value=origen(vehiculo), inline=True)
+def main():
+    if len(sys.argv) < 4:
+        print(f"Uso: {sys.argv[0]} <media_vanilla> <workshop_content_108600> <salida.json>")
+        sys.exit(1)
 
-    stats = vehiculo.get("stats", {})
-    for clave, etiqueta in ESTADISTICAS_VEHICULO:
-        if clave in stats:
-            embed.add_field(name=etiqueta, value=f"{stats[clave]:g}", inline=True)
+    carpeta_media = Path(sys.argv[1])
+    carpeta_content = Path(sys.argv[2])
+    ruta_salida = Path(sys.argv[3])
+    carpeta_previews = ruta_salida.parent / "vehicle_previews"
 
-    if stats:
-        embed.set_footer(text="Valores internos del juego, sin unidades reales")
-    return embed
+    todos = procesar_vanilla(carpeta_media)
 
+    mods_con_vehiculos = 0
+    for carpeta_workshop in sorted(p for p in carpeta_content.iterdir() if p.is_dir()):
+        carpeta_mods = carpeta_workshop / "mods"
+        if not carpeta_mods.exists():
+            continue
+        for carpeta_mod in sorted(p for p in carpeta_mods.iterdir() if p.is_dir()):
+            entradas = procesar_mod(carpeta_mod, carpeta_previews)
+            if entradas:
+                mods_con_vehiculos += 1
+                todos.extend(entradas)
 
-async def enviar_resultado(interaction: discord.Interaction, elemento, modo: str):
-    """Envía el resultado final como mensaje público (no efímero).
-    Modos: item_id, item_info, vehiculo_id, vehiculo_info."""
-    if modo in ("item_id", "vehiculo_id"):
-        await interaction.response.send_message(f"`{elemento['_full_id']}`")
-    elif modo == "vehiculo_info":
-        await interaction.response.send_message(embed=construir_embed_vehiculo(elemento))
-    else:  # item_info
-        embed, archivo = construir_embed(elemento)
-        if archivo:
-            await interaction.response.send_message(embed=embed, file=archivo)
-        else:
-            await interaction.response.send_message(embed=embed)
+    # Si un mismo ID aparece varias veces (versiones repetidas, o un mod que
+    # redefine uno vanilla) se queda la primera aparición, vanilla primero.
+    vistos = set()
+    unicos = []
+    for v in todos:
+        if v["_full_id"] in vistos:
+            continue
+        vistos.add(v["_full_id"])
+        unicos.append(v)
+    duplicados = len(todos) - len(unicos)
 
+    # Se descartan las variantes no funcionales (quemados / destruidos).
+    excluidos_lista = [v for v in unicos if es_no_funcional(v["_name"])]
+    unicos = [v for v in unicos if not es_no_funcional(v["_name"])]
+    solo_regla_ampliada = [
+        v["_full_id"] for v in excluidos_lista if not v["_name"].endswith(SUFIJOS_ANTIGUOS)
+    ]
 
-# --- Menú de selección cuando hay varias coincidencias --------------------
+    ruta_salida.parent.mkdir(parents=True, exist_ok=True)
+    with open(ruta_salida, "w", encoding="utf-8") as f:
+        json.dump(unicos, f, indent=2, ensure_ascii=False)
 
-class Selector(discord.ui.View):
-    def __init__(self, elementos, modo, etiqueta):
-        super().__init__(timeout=60)
-        self.elementos = elementos
-        self.modo = modo
+    n_vanilla = sum(1 for v in unicos if v["_source"] == "vanilla")
+    sin_nombre = [v for v in unicos if not v["DisplayName"]]
+    posibles_plantillas = [v for v in unicos if "template" in v["_name"].lower()]
+    sin_motor = [v for v in unicos if "engineForce" not in v["stats"]]
+    de_mods = [v for v in unicos if v["_source"] != "vanilla"]
+    con_preview = [v for v in de_mods if v["_preview"]]
 
-        # Se añade el ID como descripción porque varios elementos pueden
-        # tener el mismo nombre (por ejemplo, las puertas delantera y trasera).
-        opciones = [
-            discord.SelectOption(
-                label=etiqueta(el)[:100],
-                description=el["_full_id"][:100],
-                value=str(i),
-            )
-            for i, el in enumerate(elementos)
-        ]
-        select = discord.ui.Select(placeholder="Elige una opción...", options=opciones)
-        select.callback = self.al_seleccionar
-        self.add_item(select)
-
-    async def al_seleccionar(self, interaction: discord.Interaction):
-        elemento = self.elementos[int(interaction.data["values"][0])]
-        await enviar_resultado(interaction, elemento, self.modo)
-
-
-# --- Lógica compartida por los cuatro comandos ----------------------------
-
-async def manejar_busqueda(interaction: discord.Interaction, nombre: str, modo: str):
-    if modo.startswith("vehiculo"):
-        lista, nombres, etiqueta = VEHICULOS, NOMBRES_VEHICULOS, nombre_vehiculo
-    else:
-        lista, nombres, etiqueta = ITEMS, NOMBRES_ITEMS, nombre_mostrado
-
-    resultados, total = buscar(nombre, lista, nombres)
-
-    if not resultados:
-        await interaction.response.send_message(
-            f"No he encontrado nada parecido a **{nombre}**.", ephemeral=True
-        )
-        return
-
-    if len(resultados) == 1:
-        await enviar_resultado(interaction, resultados[0], modo)
-        return
-
-    aviso = ""
-    if total > len(resultados):
-        aviso = f" (mostrando los {len(resultados)} primeros; añade más palabras para afinar)"
-    await interaction.response.send_message(
-        f"He encontrado {total} resultados para **{nombre}**{aviso}. Elige uno:",
-        view=Selector(resultados, modo, etiqueta),
-        ephemeral=True,
-    )
+    print(f"Vehículos vanilla: {n_vanilla}")
+    print(f"Mods con vehículos: {mods_con_vehiculos}")
+    print(f"Total de vehículos únicos: {len(unicos)} ({duplicados} duplicados descartados)")
+    print(f"Excluidos por no funcionales: {len(excluidos_lista)}")
+    print(f"  Excluidos solo por la regla ampliada: {len(solo_regla_ampliada)}")
+    print("  Ejemplos:", solo_regla_ampliada[:15])
+    print(f"Con nombre en inglés: {len(unicos) - len(sin_nombre)}")
+    print(f"Sin nombre en inglés: {len(sin_nombre)}")
+    print(f"Nombres que contienen 'template': {len(posibles_plantillas)}")
+    print("Cobertura de estadísticas:")
+    for campo in CAMPOS_ESTADISTICAS:
+        n = sum(1 for v in unicos if campo in v["stats"])
+        print(f"  {campo}: {n} de {len(unicos)}")
+    print(f"Sin engineForce: {len(sin_motor)}")
+    print("  Ejemplos:", [(v["_full_id"], v["_source_file"]) for v in sin_motor[:6]])
+    print(f"Vehículos de mods con imagen de preview: {len(con_preview)} de {len(de_mods)}")
+    print(f"Guardado: {ruta_salida}")
 
 
-# --- Bot y comandos ---------------------------------------------------
-
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-
-@client.event
-async def on_ready():
-    await tree.sync()
-    print(f"✅ Conectado como {client.user} (ID: {client.user.id})")
-    print(f"   {len(ITEMS)} items ({len(items_vanilla)} vanilla + {len(items_mods)} de mods)")
-    print(f"   {len(VEHICULOS)} vehículos")
-
-
-@tree.command(name="getitemid", description="Devuelve el ID de un item de Project Zomboid")
-@app_commands.describe(nombre="Nombre del item a buscar (en cualquier idioma soportado)")
-async def getitemid(interaction: discord.Interaction, nombre: str):
-    await manejar_busqueda(interaction, nombre, "item_id")
-
-
-@tree.command(name="getiteminfo", description="Muestra la ficha completa de un item de Project Zomboid")
-@app_commands.describe(nombre="Nombre del item a buscar (en cualquier idioma soportado)")
-async def getiteminfo(interaction: discord.Interaction, nombre: str):
-    await manejar_busqueda(interaction, nombre, "item_info")
-
-
-@tree.command(name="getvehicleid", description="Devuelve el ID de un vehículo de Project Zomboid")
-@app_commands.describe(nombre="Nombre del vehículo a buscar (en cualquier idioma soportado)")
-async def getvehicleid(interaction: discord.Interaction, nombre: str):
-    await manejar_busqueda(interaction, nombre, "vehiculo_id")
-
-
-@tree.command(name="getvehicleinfo", description="Muestra la ficha de un vehículo de Project Zomboid")
-@app_commands.describe(nombre="Nombre del vehículo a buscar (en cualquier idioma soportado)")
-async def getvehicleinfo(interaction: discord.Interaction, nombre: str):
-    await manejar_busqueda(interaction, nombre, "vehiculo_info")
-
-
-client.run(TOKEN)
+if __name__ == "__main__":
+    main()
