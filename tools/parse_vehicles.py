@@ -13,6 +13,10 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
   Se leen todos los .json y .txt de cada carpeta de idioma, sin asumir el
   nombre del archivo.
 - Idiomas: inglés (nombre principal) y los mismos 10 soportados para items.
+- Estadísticas ("stats"): mass, engineForce, engineQuality, engineLoudness,
+  maxSpeed y seats, leídas SOLO del nivel superior del vehículo (se ignoran
+  los bloques anidados: model, skin, wheel, part...). Son valores internos
+  del juego, sin unidades reales.
 - Se excluyen las variantes no funcionales (coches quemados o destruidos),
   detectadas por el sufijo de su nombre de script.
 
@@ -36,6 +40,9 @@ IDIOMAS = {"EN", "ES", "ES_CL", "ES_MX", "FR", "DE", "IT", "PT", "RU", "PL", "NL
 # conducir, así que no se incluyen en la lista.
 SUFIJOS_NO_FUNCIONALES = ("Burnt", "SmashedFront", "SmashedRear", "SmashedLeft", "SmashedRight")
 
+# Propiedades del nivel superior del vehículo que se guardan en "stats".
+CAMPOS_ESTADISTICAS = ("mass", "engineForce", "engineQuality", "engineLoudness", "maxSpeed", "seats")
+
 
 def quitar_comentarios(texto):
     return "\n".join(linea.split("//")[0] for linea in texto.split("\n"))
@@ -54,8 +61,40 @@ def buscar_cierre(texto, indice_apertura):
     return -1
 
 
+def propiedades_nivel_superior(cuerpo):
+    """Devuelve {clave: valor} de las líneas 'clave = valor' que están
+    directamente dentro del vehículo, ignorando el contenido de los bloques
+    anidados (model, skin, wheel, part...)."""
+    texto = []
+    profundidad = 0
+    for c in cuerpo:
+        if c == "{":
+            profundidad += 1
+        elif c == "}":
+            profundidad -= 1
+        elif profundidad == 0:
+            texto.append(c)
+
+    props = {}
+    for linea in "".join(texto).split("\n"):
+        linea = linea.strip().rstrip(",").strip()
+        if "=" in linea:
+            clave, _, valor = linea.partition("=")
+            props[clave.strip()] = valor.strip()
+    return props
+
+
+def a_numero(valor):
+    """Convierte '120.0' en 120 y '0.8' en 0.8. Devuelve None si no es un número."""
+    try:
+        n = float(valor.strip().rstrip("fF"))
+    except ValueError:
+        return None
+    return int(n) if n == int(n) else n
+
+
 def vehiculos_de_archivo(ruta):
-    """Devuelve una lista de (modulo, nombre_script) de un archivo de script."""
+    """Devuelve una lista de (modulo, nombre_script, propiedades) de un archivo."""
     texto = quitar_comentarios(ruta.read_text(encoding="utf-8", errors="replace"))
     encontrados = []
 
@@ -75,7 +114,8 @@ def vehiculos_de_archivo(ruta):
             cierra_v = buscar_cierre(cuerpo, m.end() - 1)
             if cierra_v < 0:
                 break
-            encontrados.append((modulo, m.group(1)))
+            props = propiedades_nivel_superior(cuerpo[m.end():cierra_v])
+            encontrados.append((modulo, m.group(1), props))
             pos = cierra_v + 1  # salta el contenido del vehículo (partes, modelos...)
 
     return encontrados
@@ -127,8 +167,16 @@ def leer_mod_info(ruta):
 
 def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
     entradas = []
-    for modulo, nombre_script in pares:
+    for modulo, nombre_script, props in pares:
         por_idioma = nombres.get(nombre_script, {})
+
+        stats = {}
+        for campo in CAMPOS_ESTADISTICAS:
+            if campo in props:
+                numero = a_numero(props[campo])
+                if numero is not None:
+                    stats[campo] = numero
+
         entradas.append({
             "_name": nombre_script,
             "_module": modulo,
@@ -138,6 +186,7 @@ def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
             "_source_file": archivo,
             "DisplayName": por_idioma.get("EN"),
             "_translations": {i: n for i, n in por_idioma.items() if i != "EN"},
+            "stats": stats,
         })
     return entradas
 
@@ -226,6 +275,7 @@ def main():
     n_vanilla = sum(1 for v in unicos if v["_source"] == "vanilla")
     sin_nombre = [v for v in unicos if not v["DisplayName"]]
     posibles_plantillas = [v for v in unicos if "template" in v["_name"].lower()]
+    sin_motor = [v for v in unicos if "engineForce" not in v["stats"]]
 
     print(f"Vehículos vanilla: {n_vanilla}")
     print(f"Mods con vehículos: {mods_con_vehiculos}")
@@ -233,9 +283,13 @@ def main():
     print(f"Excluidos por no funcionales: {excluidos}")
     print(f"Con nombre en inglés: {len(unicos) - len(sin_nombre)}")
     print(f"Sin nombre en inglés: {len(sin_nombre)}")
-    print("  Ejemplos sin nombre:", [v["_full_id"] for v in sin_nombre[:8]])
     print(f"Nombres que contienen 'template': {len(posibles_plantillas)}")
-    print("  Ejemplos:", [v["_full_id"] for v in posibles_plantillas[:5]])
+    print("Cobertura de estadísticas:")
+    for campo in CAMPOS_ESTADISTICAS:
+        n = sum(1 for v in unicos if campo in v["stats"])
+        print(f"  {campo}: {n} de {len(unicos)}")
+    print(f"Sin engineForce: {len(sin_motor)}")
+    print("  Ejemplos:", [(v["_full_id"], v["_source_file"]) for v in sin_motor[:6]])
     print(f"Guardado: {ruta_salida}")
 
 

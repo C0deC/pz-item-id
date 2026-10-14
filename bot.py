@@ -171,20 +171,41 @@ def construir_embed(item):
     return embed, archivo
 
 
+# Estadísticas de vehículo que se muestran, en este orden. Solo aparecen
+# las que el vehículo tenga definidas.
+ESTADISTICAS_VEHICULO = [
+    ("engineForce", "Fuerza del motor"),
+    ("maxSpeed", "Velocidad máx."),
+    ("mass", "Masa"),
+    ("seats", "Asientos"),
+    ("engineQuality", "Calidad del motor"),
+    ("engineLoudness", "Ruido del motor"),
+]
+
+
 def construir_embed_vehiculo(vehiculo):
     embed = discord.Embed(title=nombre_vehiculo(vehiculo), color=discord.Color.dark_grey())
     embed.add_field(name="ID", value=f"`{vehiculo['_full_id']}`", inline=True)
     embed.add_field(name="Origen", value=origen(vehiculo), inline=True)
+
+    stats = vehiculo.get("stats", {})
+    for clave, etiqueta in ESTADISTICAS_VEHICULO:
+        if clave in stats:
+            embed.add_field(name=etiqueta, value=f"{stats[clave]:g}", inline=True)
+
+    if stats:
+        embed.set_footer(text="Valores internos del juego, sin unidades reales")
     return embed
 
 
 async def enviar_resultado(interaction: discord.Interaction, elemento, modo: str):
-    """Envía el resultado final como mensaje público (no efímero)."""
-    if modo == "id":
+    """Envía el resultado final como mensaje público (no efímero).
+    Modos: item_id, item_info, vehiculo_id, vehiculo_info."""
+    if modo in ("item_id", "vehiculo_id"):
         await interaction.response.send_message(f"`{elemento['_full_id']}`")
-    elif modo == "vehiculo":
+    elif modo == "vehiculo_info":
         await interaction.response.send_message(embed=construir_embed_vehiculo(elemento))
-    else:
+    else:  # item_info
         embed, archivo = construir_embed(elemento)
         if archivo:
             await interaction.response.send_message(embed=embed, file=archivo)
@@ -198,7 +219,7 @@ class Selector(discord.ui.View):
     def __init__(self, elementos, modo, etiqueta):
         super().__init__(timeout=60)
         self.elementos = elementos
-        self.modo = modo  # "id", "info" o "vehiculo"
+        self.modo = modo
 
         # Se añade el ID como descripción porque varios elementos pueden
         # tener el mismo nombre (por ejemplo, las puertas delantera y trasera).
@@ -219,10 +240,10 @@ class Selector(discord.ui.View):
         await enviar_resultado(interaction, elemento, self.modo)
 
 
-# --- Lógica compartida por los tres comandos ------------------------------
+# --- Lógica compartida por los cuatro comandos ----------------------------
 
 async def manejar_busqueda(interaction: discord.Interaction, nombre: str, modo: str):
-    if modo == "vehiculo":
+    if modo.startswith("vehiculo"):
         lista, nombres, etiqueta = VEHICULOS, NOMBRES_VEHICULOS, nombre_vehiculo
     else:
         lista, nombres, etiqueta = ITEMS, NOMBRES_ITEMS, nombre_mostrado
@@ -264,22 +285,28 @@ async def on_ready():
     print(f"   {len(VEHICULOS)} vehículos")
 
 
-@tree.command(name="getid", description="Devuelve el ID de un item de Project Zomboid")
+@tree.command(name="getitemid", description="Devuelve el ID de un item de Project Zomboid")
 @app_commands.describe(nombre="Nombre del item a buscar (en cualquier idioma soportado)")
-async def getid(interaction: discord.Interaction, nombre: str):
-    await manejar_busqueda(interaction, nombre, "id")
+async def getitemid(interaction: discord.Interaction, nombre: str):
+    await manejar_busqueda(interaction, nombre, "item_id")
 
 
-@tree.command(name="getinfo", description="Muestra la ficha completa de un item de Project Zomboid")
+@tree.command(name="getiteminfo", description="Muestra la ficha completa de un item de Project Zomboid")
 @app_commands.describe(nombre="Nombre del item a buscar (en cualquier idioma soportado)")
-async def getinfo(interaction: discord.Interaction, nombre: str):
-    await manejar_busqueda(interaction, nombre, "info")
+async def getiteminfo(interaction: discord.Interaction, nombre: str):
+    await manejar_busqueda(interaction, nombre, "item_info")
 
 
-@tree.command(name="getvehicle", description="Devuelve el ID de un vehículo de Project Zomboid")
+@tree.command(name="getvehicleid", description="Devuelve el ID de un vehículo de Project Zomboid")
 @app_commands.describe(nombre="Nombre del vehículo a buscar (en cualquier idioma soportado)")
-async def getvehicle(interaction: discord.Interaction, nombre: str):
-    await manejar_busqueda(interaction, nombre, "vehiculo")
+async def getvehicleid(interaction: discord.Interaction, nombre: str):
+    await manejar_busqueda(interaction, nombre, "vehiculo_id")
+
+
+@tree.command(name="getvehicleinfo", description="Muestra la ficha de un vehículo de Project Zomboid")
+@app_commands.describe(nombre="Nombre del vehículo a buscar (en cualquier idioma soportado)")
+async def getvehicleinfo(interaction: discord.Interaction, nombre: str):
+    await manejar_busqueda(interaction, nombre, "vehiculo_info")
 
 
 client.run(TOKEN)
