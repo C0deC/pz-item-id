@@ -29,6 +29,9 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
   Los vehículos vanilla no tienen imagen.
 - Se excluyen las variantes no funcionales (coches quemados o destruidos):
   cualquier nombre de script que contenga "burnt" o "smashed".
+- Remolques: se consideran remolques los vehículos sin engineForce o sin
+  asientos (clave ausente o valor 0). Con REMOLQUES = False se excluyen; con
+  REMOLQUES = True se incluyen.
 
 Uso:
     python tools/parse_vehicles.py <media_vanilla> <workshop_content_108600> <salida.json>
@@ -57,6 +60,9 @@ MARCAS_NO_FUNCIONALES = ("burnt", "smashed")
 # Solo para el diagnóstico final: sufijos que ya excluía la primera versión.
 SUFIJOS_ANTIGUOS = ("Burnt", "SmashedFront", "SmashedRear", "SmashedLeft", "SmashedRight")
 
+# Remolques: True = incluirlos en la lista, False = excluirlos.
+REMOLQUES = False
+
 # Propiedades del nivel superior del vehículo que se guardan en "stats".
 CAMPOS_ESTADISTICAS = ("mass", "engineForce", "engineQuality", "engineLoudness", "maxSpeed", "seats")
 
@@ -66,6 +72,13 @@ TAMANO_MAX_PREVIEW = 512
 def es_no_funcional(nombre):
     n = nombre.lower()
     return any(marca in n for marca in MARCAS_NO_FUNCIONALES)
+
+
+def parece_remolque(vehiculo):
+    """Heurística: un remolque no tiene motor ni asientos. Se considera
+    remolque al vehículo sin engineForce o sin asientos (ausentes o a 0)."""
+    stats = vehiculo["stats"]
+    return not stats.get("engineForce") or not stats.get("seats")
 
 
 def quitar_comentarios(texto):
@@ -391,6 +404,13 @@ def main():
         v["_full_id"] for v in excluidos_lista if not v["_name"].endswith(SUFIJOS_ANTIGUOS)
     ]
 
+    # Se descartan los remolques (sin motor o sin asientos) salvo que
+    # REMOLQUES esté a True.
+    remolques = []
+    if not REMOLQUES:
+        remolques = [v for v in vehiculos if parece_remolque(v)]
+        vehiculos = [v for v in vehiculos if not parece_remolque(v)]
+
     for v in vehiculos:
         v.pop("_plantilla", None)
         v.pop("_hereda_de", None)
@@ -401,7 +421,6 @@ def main():
 
     n_vanilla = sum(1 for v in vehiculos if v["_source"] == "vanilla")
     sin_nombre = [v for v in vehiculos if not v["DisplayName"]]
-    sin_motor = [v for v in vehiculos if "engineForce" not in v["stats"]]
     de_mods = [v for v in vehiculos if v["_source"] != "vanilla"]
     con_preview = [v for v in de_mods if v["_preview"]]
 
@@ -411,17 +430,18 @@ def main():
     print(f"Plantillas leídas (solo como fuente de datos): {n_plantillas}")
     print(f"Excluidos por no funcionales: {len(excluidos_lista)}")
     print(f"  Excluidos solo por la regla ampliada: {len(solo_regla_ampliada)}")
+    print(f"Remolques {'incluidos' if REMOLQUES else 'excluidos'} (REMOLQUES = {REMOLQUES}): {len(remolques)}")
+    for v in remolques:
+        s = v["stats"]
+        print(f"  {v['_full_id']} | {v['_source']} | motor: {s.get('engineForce')} | asientos: {s.get('seats')}")
     print(f"Con nombre en inglés: {len(vehiculos) - len(sin_nombre)}")
     print(f"Sin nombre en inglés: {len(sin_nombre)}")
     print(f"Herencia 'template!': {ganan_motor} vehículos ganan engineForce")
     print(f"  Referencias 'template!' sin resolver: {len(sin_resolver)}")
-    print("  Ejemplos:", sin_resolver[:8])
     print("Cobertura de estadísticas:")
     for campo in CAMPOS_ESTADISTICAS:
         n = sum(1 for v in vehiculos if campo in v["stats"])
         print(f"  {campo}: {n} de {len(vehiculos)}")
-    print(f"Sin engineForce: {len(sin_motor)}")
-    print("  Ejemplos:", [(v["_full_id"], v["_source_file"]) for v in sin_motor[:8]])
     print(f"Vehículos de mods con imagen de preview: {len(con_preview)} de {len(de_mods)}")
     print(f"Guardado: {ruta_salida}")
 
