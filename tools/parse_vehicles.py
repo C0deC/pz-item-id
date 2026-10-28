@@ -29,9 +29,12 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
   Los vehículos vanilla no tienen imagen.
 - Se excluyen las variantes no funcionales (coches quemados o destruidos):
   cualquier nombre de script que contenga "burnt" o "smashed".
-- Remolques: se consideran remolques los vehículos sin engineForce o sin
-  asientos (clave ausente o valor 0). Con REMOLQUES = False se excluyen; con
-  REMOLQUES = True se incluyen.
+- Remolques: con REMOLQUES = False se excluyen; con REMOLQUES = True se
+  incluyen. Se considera remolque al vehículo que (1) no tiene engineForce o
+  asientos, (2) tiene un nombre de script que empieza por "Trailer", o
+  (3) tiene un nombre en inglés que contiene "trailer". Los remolques de
+  vanilla y de mods heredan motor y asientos genéricos, por eso no basta
+  con mirar las estadísticas.
 
 Uso:
     python tools/parse_vehicles.py <media_vanilla> <workshop_content_108600> <salida.json>
@@ -74,11 +77,16 @@ def es_no_funcional(nombre):
     return any(marca in n for marca in MARCAS_NO_FUNCIONALES)
 
 
-def parece_remolque(vehiculo):
-    """Heurística: un remolque no tiene motor ni asientos. Se considera
-    remolque al vehículo sin engineForce o sin asientos (ausentes o a 0)."""
+def motivo_remolque(vehiculo):
+    """Devuelve el motivo por el que se considera remolque, o None si no lo es."""
     stats = vehiculo["stats"]
-    return not stats.get("engineForce") or not stats.get("seats")
+    if not stats.get("engineForce") or not stats.get("seats"):
+        return "sin motor o sin asientos"
+    if vehiculo["_name"].lower().startswith("trailer"):
+        return "nombre de script empieza por Trailer"
+    if "trailer" in (vehiculo.get("DisplayName") or "").lower():
+        return "nombre en inglés contiene 'trailer'"
+    return None
 
 
 def quitar_comentarios(texto):
@@ -404,12 +412,12 @@ def main():
         v["_full_id"] for v in excluidos_lista if not v["_name"].endswith(SUFIJOS_ANTIGUOS)
     ]
 
-    # Se descartan los remolques (sin motor o sin asientos) salvo que
-    # REMOLQUES esté a True.
+    # Se descartan los remolques salvo que REMOLQUES esté a True.
     remolques = []
     if not REMOLQUES:
-        remolques = [v for v in vehiculos if parece_remolque(v)]
-        vehiculos = [v for v in vehiculos if not parece_remolque(v)]
+        marcados = [(v, motivo_remolque(v)) for v in vehiculos]
+        remolques = [(v, motivo) for v, motivo in marcados if motivo]
+        vehiculos = [v for v, motivo in marcados if not motivo]
 
     for v in vehiculos:
         v.pop("_plantilla", None)
@@ -431,9 +439,8 @@ def main():
     print(f"Excluidos por no funcionales: {len(excluidos_lista)}")
     print(f"  Excluidos solo por la regla ampliada: {len(solo_regla_ampliada)}")
     print(f"Remolques {'incluidos' if REMOLQUES else 'excluidos'} (REMOLQUES = {REMOLQUES}): {len(remolques)}")
-    for v in remolques:
-        s = v["stats"]
-        print(f"  {v['_full_id']} | {v['_source']} | motor: {s.get('engineForce')} | asientos: {s.get('seats')}")
+    for v, motivo in remolques:
+        print(f"  {v['_full_id']} | {v['_source']} | {motivo}")
     print(f"Con nombre en inglés: {len(vehiculos) - len(sin_nombre)}")
     print(f"Sin nombre en inglés: {len(sin_nombre)}")
     print(f"Herencia 'template!': {ganan_motor} vehículos ganan engineForce")
