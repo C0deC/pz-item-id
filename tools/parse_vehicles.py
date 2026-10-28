@@ -3,9 +3,13 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
 único data/vehicles.json.
 
 - ID: Módulo.NombreDelScript (ej. Base.70barracuda), a partir de los
-  bloques `vehicle Nombre { ... }` de media/scripts. Los bloques
-  `template vehicle ...` no empiezan la línea por "vehicle", así que se
-  ignoran (son plantillas, no vehículos que se puedan generar).
+  bloques `vehicle Nombre { ... }` de media/scripts.
+- Plantillas: también se leen los bloques `template vehicle Nombre { ... }`,
+  pero solo como fuente de datos heredables; no aparecen en la lista final.
+- Herencia: muchas variantes (rotuladas, "expanded"...) declaran
+  `template! = OtroVehiculo` y no repiten el motor, la masa, etc. Las
+  estadísticas que les faltan se toman del vehículo (o plantilla) del que
+  heredan, encadenando si ese a su vez hereda de otro.
 - Nombre legible: no está en el script, sino en las traducciones, con la
   clave IGUI_VehicleName<NombreDelScript>. Se aceptan dos formatos:
       JSON:  "IGUI_VehicleNameCarLights": "Chevalier Nyala",
@@ -35,7 +39,8 @@ from pathlib import Path
 
 from PIL import Image
 
-VEHICLE_RE = re.compile(r"^[ \t]*vehicle[ \t]+([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
+# Grupo 1: prefijo 'template' (si lo hay). Grupo 2: nombre del script.
+VEHICLE_RE = re.compile(r"^[ \t]*(template[ \t]+)?vehicle[ \t]+([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
 MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
 NOMBRE_RE = re.compile(r'^\s*"?IGUI_VehicleName([A-Za-z0-9_]+)"?\s*[=:]\s*"?(.*?)"?\s*,?\s*$')
 VERSION_DIR_RE = re.compile(r"^\d+(\.\d+)*$")
@@ -47,7 +52,7 @@ IDIOMAS = {"EN", "ES", "ES_CL", "ES_MX", "FR", "DE", "IT", "PT", "RU", "PL", "NL
 # sin distinguir mayúsculas (ej. NormalCarBurntPolice).
 MARCAS_NO_FUNCIONALES = ("burnt", "smashed")
 
-# Solo para el diagnóstico final: sufijos que ya excluía la versión anterior.
+# Solo para el diagnóstico final: sufijos que ya excluía la primera versión.
 SUFIJOS_ANTIGUOS = ("Burnt", "SmashedFront", "SmashedRear", "SmashedLeft", "SmashedRight")
 
 # Propiedades del nivel superior del vehículo que se guardan en "stats".
@@ -81,7 +86,9 @@ def buscar_cierre(texto, indice_apertura):
 def propiedades_nivel_superior(cuerpo):
     """Devuelve {clave: valor} de las líneas 'clave = valor' que están
     directamente dentro del vehículo, ignorando el contenido de los bloques
-    anidados (model, skin, wheel, part...)."""
+    anidados (model, skin, wheel, part...). Una clave repetida (por ejemplo
+    varios 'template = ...') conserva el último valor; 'template!' es una
+    clave distinta y se conserva aparte."""
     texto = []
     profundidad = 0
     for c in cuerpo:
@@ -111,7 +118,7 @@ def a_numero(valor):
 
 
 def vehiculos_de_archivo(ruta):
-    """Devuelve una lista de (modulo, nombre_script, propiedades) de un archivo."""
+    """Devuelve una lista de (modulo, nombre_script, propiedades, es_plantilla)."""
     texto = quitar_comentarios(ruta.read_text(encoding="utf-8", errors="replace"))
     encontrados = []
 
@@ -132,7 +139,7 @@ def vehiculos_de_archivo(ruta):
             if cierra_v < 0:
                 break
             props = propiedades_nivel_superior(cuerpo[m.end():cierra_v])
-            encontrados.append((modulo, m.group(1), props))
+            encontrados.append((modulo, m.group(2), props, m.group(1) is not None))
             pos = cierra_v + 1  # salta el contenido del vehículo (partes, modelos...)
 
     return encontrados
@@ -214,7 +221,7 @@ def copiar_preview(carpeta_mod, carpeta_version, carpeta_common, poster, carpeta
 
 def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
     entradas = []
-    for modulo, nombre_script, props in pares:
+    for modulo, nombre_script, props, es_plantilla in pares:
         por_idioma = nombres.get(nombre_script, {})
 
         stats = {}
@@ -232,11 +239,53 @@ def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
             "_source_name": nombre_origen,
             "_source_file": archivo,
             "_preview": None,
+            "_plantilla": es_plantilla,
+            "_hereda_de": props.get("template!"),
             "DisplayName": por_idioma.get("EN"),
             "_translations": {i: n for i, n in por_idioma.items() if i != "EN"},
             "stats": stats,
         })
     return entradas
+
+
+def resolver_herencia(entradas):
+    """Rellena las estadísticas que faltan con las del vehículo (o plantilla)
+    del que se hereda mediante 'template! = Nombre'. Lo que el vehículo define
+    por sí mismo tiene prioridad sobre lo heredado.
+    Devuelve (vehiculos_que_ganan_engineForce, referencias_sin_resolver)."""
+    vehiculos = {e["_full_id"]: e for e in entradas if not e["_plantilla"]}
+    plantillas = {e["_full_id"]: e for e in entradas if e["_plantilla"]}
+
+    def buscar_padre(e):
+        ref = e["_hereda_de"]
+        id_padre = ref if "." in ref else f"{e['_module']}.{ref}"
+        return vehiculos.get(id_padre) or plantillas.get(id_padre)
+
+    def stats_completas(e, visitados):
+        stats = dict(e["stats"])
+        if not e["_hereda_de"] or e["_full_id"] in visitados:
+            return stats
+        padre = buscar_padre(e)
+        if padre is None or padre is e:
+            return stats
+        for campo, valor in stats_completas(padre, visitados | {e["_full_id"]}).items():
+            stats.setdefault(campo, valor)
+        return stats
+
+    ganan_motor = 0
+    sin_resolver = []
+    for e in entradas:
+        if not e["_hereda_de"]:
+            continue
+        if buscar_padre(e) is None:
+            if not e["_plantilla"]:
+                sin_resolver.append((e["_full_id"], e["_hereda_de"]))
+            continue
+        tenia_motor = "engineForce" in e["stats"]
+        e["stats"] = stats_completas(e, set())
+        if not tenia_motor and "engineForce" in e["stats"]:
+            ganan_motor += 1
+    return ganan_motor, sin_resolver
 
 
 def procesar_vanilla(carpeta_media):
@@ -278,7 +327,7 @@ def procesar_mod(carpeta_mod, carpeta_previews):
             pares = vehiculos_de_archivo(archivo)
             entradas.extend(construir_entradas(pares, nombres, carpeta_mod.name, nombre_mod, archivo.name))
 
-    if entradas:
+    if any(not e["_plantilla"] for e in entradas):
         preview = copiar_preview(carpeta_mod, carpeta_version, carpeta_common, poster, carpeta_previews)
         for e in entradas:
             e["_preview"] = preview
@@ -304,54 +353,67 @@ def main():
             continue
         for carpeta_mod in sorted(p for p in carpeta_mods.iterdir() if p.is_dir()):
             entradas = procesar_mod(carpeta_mod, carpeta_previews)
-            if entradas:
+            if any(not e["_plantilla"] for e in entradas):
                 mods_con_vehiculos += 1
-                todos.extend(entradas)
+            todos.extend(entradas)
 
     # Si un mismo ID aparece varias veces (versiones repetidas, o un mod que
     # redefine uno vanilla) se queda la primera aparición, vanilla primero.
     vistos = set()
     unicos = []
-    for v in todos:
-        if v["_full_id"] in vistos:
+    for e in todos:
+        clave = (e["_full_id"], e["_plantilla"])
+        if clave in vistos:
             continue
-        vistos.add(v["_full_id"])
-        unicos.append(v)
+        vistos.add(clave)
+        unicos.append(e)
     duplicados = len(todos) - len(unicos)
 
+    # La herencia se resuelve antes de descartar nada, por si un vehículo
+    # hereda de otro que luego se excluye.
+    ganan_motor, sin_resolver = resolver_herencia(unicos)
+
+    n_plantillas = sum(1 for e in unicos if e["_plantilla"])
+    candidatos = [e for e in unicos if not e["_plantilla"]]
+
     # Se descartan las variantes no funcionales (quemados / destruidos).
-    excluidos_lista = [v for v in unicos if es_no_funcional(v["_name"])]
-    unicos = [v for v in unicos if not es_no_funcional(v["_name"])]
+    excluidos_lista = [v for v in candidatos if es_no_funcional(v["_name"])]
+    vehiculos = [v for v in candidatos if not es_no_funcional(v["_name"])]
     solo_regla_ampliada = [
         v["_full_id"] for v in excluidos_lista if not v["_name"].endswith(SUFIJOS_ANTIGUOS)
     ]
 
+    for v in vehiculos:
+        v.pop("_plantilla", None)
+        v.pop("_hereda_de", None)
+
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
     with open(ruta_salida, "w", encoding="utf-8") as f:
-        json.dump(unicos, f, indent=2, ensure_ascii=False)
+        json.dump(vehiculos, f, indent=2, ensure_ascii=False)
 
-    n_vanilla = sum(1 for v in unicos if v["_source"] == "vanilla")
-    sin_nombre = [v for v in unicos if not v["DisplayName"]]
-    posibles_plantillas = [v for v in unicos if "template" in v["_name"].lower()]
-    sin_motor = [v for v in unicos if "engineForce" not in v["stats"]]
-    de_mods = [v for v in unicos if v["_source"] != "vanilla"]
+    n_vanilla = sum(1 for v in vehiculos if v["_source"] == "vanilla")
+    sin_nombre = [v for v in vehiculos if not v["DisplayName"]]
+    sin_motor = [v for v in vehiculos if "engineForce" not in v["stats"]]
+    de_mods = [v for v in vehiculos if v["_source"] != "vanilla"]
     con_preview = [v for v in de_mods if v["_preview"]]
 
     print(f"Vehículos vanilla: {n_vanilla}")
     print(f"Mods con vehículos: {mods_con_vehiculos}")
-    print(f"Total de vehículos únicos: {len(unicos)} ({duplicados} duplicados descartados)")
+    print(f"Total de vehículos únicos: {len(vehiculos)} ({duplicados} duplicados descartados)")
+    print(f"Plantillas leídas (solo como fuente de datos): {n_plantillas}")
     print(f"Excluidos por no funcionales: {len(excluidos_lista)}")
     print(f"  Excluidos solo por la regla ampliada: {len(solo_regla_ampliada)}")
-    print("  Ejemplos:", solo_regla_ampliada[:15])
-    print(f"Con nombre en inglés: {len(unicos) - len(sin_nombre)}")
+    print(f"Con nombre en inglés: {len(vehiculos) - len(sin_nombre)}")
     print(f"Sin nombre en inglés: {len(sin_nombre)}")
-    print(f"Nombres que contienen 'template': {len(posibles_plantillas)}")
+    print(f"Herencia 'template!': {ganan_motor} vehículos ganan engineForce")
+    print(f"  Referencias 'template!' sin resolver: {len(sin_resolver)}")
+    print("  Ejemplos:", sin_resolver[:8])
     print("Cobertura de estadísticas:")
     for campo in CAMPOS_ESTADISTICAS:
-        n = sum(1 for v in unicos if campo in v["stats"])
-        print(f"  {campo}: {n} de {len(unicos)}")
+        n = sum(1 for v in vehiculos if campo in v["stats"])
+        print(f"  {campo}: {n} de {len(vehiculos)}")
     print(f"Sin engineForce: {len(sin_motor)}")
-    print("  Ejemplos:", [(v["_full_id"], v["_source_file"]) for v in sin_motor[:6]])
+    print("  Ejemplos:", [(v["_full_id"], v["_source_file"]) for v in sin_motor[:8]])
     print(f"Vehículos de mods con imagen de preview: {len(con_preview)} de {len(de_mods)}")
     print(f"Guardado: {ruta_salida}")
 
