@@ -9,7 +9,9 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
 - Herencia: muchas variantes (rotuladas, "expanded"...) declaran
   `template! = OtroVehiculo` y no repiten el motor, la masa, etc. Las
   estadísticas que les faltan se toman del vehículo (o plantilla) del que
-  heredan, encadenando si ese a su vez hereda de otro.
+  heredan, encadenando si ese a su vez hereda de otro. Un vehículo puede
+  llamarse igual que la plantilla de la que hereda (vehicle StepVan con
+  template! = StepVan); en ese caso se usa la plantilla.
 - Nombre legible: no está en el script, sino en las traducciones, con la
   clave IGUI_VehicleName<NombreDelScript>. Se aceptan dos formatos:
       JSON:  "IGUI_VehicleNameCarLights": "Chevalier Nyala",
@@ -259,14 +261,20 @@ def resolver_herencia(entradas):
     def buscar_padre(e):
         ref = e["_hereda_de"]
         id_padre = ref if "." in ref else f"{e['_module']}.{ref}"
-        return vehiculos.get(id_padre) or plantillas.get(id_padre)
+        # Un vehículo puede llamarse igual que la plantilla de la que hereda
+        # (vehicle StepVan con template! = StepVan). Se descarta el propio
+        # elemento para que encuentre la plantilla y no se tome a sí mismo.
+        for candidato in (vehiculos.get(id_padre), plantillas.get(id_padre)):
+            if candidato is not None and candidato is not e:
+                return candidato
+        return None
 
     def stats_completas(e, visitados):
         stats = dict(e["stats"])
         if not e["_hereda_de"] or e["_full_id"] in visitados:
             return stats
         padre = buscar_padre(e)
-        if padre is None or padre is e:
+        if padre is None:
             return stats
         for campo, valor in stats_completas(padre, visitados | {e["_full_id"]}).items():
             stats.setdefault(campo, valor)
