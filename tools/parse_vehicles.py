@@ -31,9 +31,19 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
     1. un `capacity` escrito en su bloque container ("script"), o si no
     2. el MaxCapacity del item de la pieza ("item"): itemType + mechanicType
        del vehículo, por ejemplo Base.SmallTrunk + 3 -> Base.SmallTrunk3.
-  Los contenedores de combustible o aire (los que tienen contentType, el
-  depósito y los neumáticos) no cuentan como almacenamiento. Necesita
-  data/items.json y data/items_mods.json junto a la salida.
+  No cuentan como almacenamiento: los contenedores de combustible o aire
+  (los que tienen contentType, el depósito, los neumáticos y la batería) ni
+  las piezas ficticias (sin capacidad y con itemType = nil: los mods
+  desactivan así el TruckBed genérico y ponen su propio maletero).
+  Necesita data/items.json y data/items_mods.json junto a la salida.
+- Almacenamiento ("almacenamiento"): suma de los contenedores de
+  almacenamiento con capacidad conocida, SIN el asiento del conductor
+  (SeatFrontLeft), repartida en:
+    maletero: piezas con "Trunk" en el nombre, TruckBed y TruckBedOpen
+    asientos: piezas Seat*
+    otros:    el resto (guantera, baca, soporte de armas, cajones...)
+  "completo" es False si algún contenedor real no tiene capacidad
+  resoluble (el total es entonces un mínimo).
 - Imagen: para los vehículos de mods se copia el preview.png del mod (el
   indicado en 'poster=' de mod.info) a data/vehicle_previews/, reducido a
   un máximo de 512 px. Es la portada del mod, no una foto de cada vehículo.
@@ -84,6 +94,10 @@ REMOLQUES = False
 
 # Piezas con contenedor que no guardan objetos (combustible, aire, batería).
 PIEZAS_NO_ALMACENAMIENTO = ("GasTank", "Tire", "Battery")
+
+# Pieza del asiento del conductor: no se cuenta, porque si se llena de
+# objetos el jugador no puede entrar al vehículo.
+ASIENTO_CONDUCTOR = "SeatFrontLeft"
 
 # Propiedades del nivel superior del vehículo que se guardan en "stats".
 CAMPOS_ESTADISTICAS = (
@@ -439,10 +453,10 @@ def capacidad_de(info, mecanica, items):
 
 def calcular_contenedores(entradas, objetivos, items):
     """Para cada vehículo de `objetivos` devuelve la lista de sus contenedores:
-    {pieza, capacidad, origen, almacenamiento, contentType}. Se resuelven las
-    piezas siguiendo, en este orden: la herencia 'template!', las inclusiones
-    de plantillas ('template = X' o 'template = X/part/Pieza') y las piezas
-    propias del vehículo (el comodín 'part Seat*' se aplica a todas las
+    {pieza, capacidad, origen, contentType, ficticio, almacenamiento}. Se
+    resuelven las piezas siguiendo, en este orden: la herencia 'template!', las
+    inclusiones de plantillas ('template = X' o 'template = X/part/Pieza') y las
+    piezas propias del vehículo (el comodín 'part Seat*' se aplica a todas las
     piezas cuyo nombre empiece igual)."""
     vehiculos, plantillas = indexar(entradas)
     cache = {}
@@ -540,44 +554,94 @@ def calcular_contenedores(entradas, objetivos, items):
             if cont is None:
                 continue
             capacidad, origen = capacidad_de(info, mecanica, items)
+
+            # Pieza ficticia: sin capacidad y con itemType = nil. Los mods
+            # desactivan así el TruckBed genérico y ponen su propio maletero.
+            tipo = str(info["props"].get("itemType", "")).strip().lower()
+            ficticio = origen == "sin dato" and tipo == "nil"
+
             contenedores.append({
                 "pieza": nombre,
                 "capacidad": capacidad,
                 "origen": origen,
                 "contentType": cont.get("contentType"),
+                "ficticio": ficticio,
                 "almacenamiento": "contentType" not in cont
-                                  and not nombre.startswith(PIEZAS_NO_ALMACENAMIENTO),
+                                  and not nombre.startswith(PIEZAS_NO_ALMACENAMIENTO)
+                                  and not ficticio,
             })
         salida[e["_full_id"]] = contenedores
     return salida
 
 
-def imprimir_censo(vehiculos, todos):
-    """Resumen de las piezas con contenedor de los vehículos finales, para
-    decidir qué cuenta como almacenamiento."""
-    censo = {}
-    tipos_contenido = Counter()
+def categoria_contenedor(pieza):
+    """Clasifica un contenedor de almacenamiento por el nombre de su pieza:
+    'conductor' (SeatFrontLeft), 'asiento', 'maletero' u 'otro'."""
+    if pieza == ASIENTO_CONDUCTOR:
+        return "conductor"
+    if pieza.startswith("Seat"):
+        return "asiento"
+    if "trunk" in pieza.lower() or pieza in ("TruckBed", "TruckBedOpen"):
+        return "maletero"
+    return "otro"
+
+
+def resumir_almacenamiento(contenedores):
+    """Suma las capacidades conocidas de los contenedores de almacenamiento,
+    sin el asiento del conductor. 'completo' es False si algún contenedor
+    real no tiene capacidad resoluble (el total es entonces un mínimo)."""
+    partes = {"maletero": 0, "asiento": 0, "otro": 0}
+    completo = True
+    for c in contenedores:
+        categoria = categoria_contenedor(c["pieza"])
+        if categoria == "conductor":
+            continue
+        if c["capacidad"] is None:
+            completo = False
+            continue
+        partes[categoria] += c["capacidad"]
+    return {
+        "total": sum(partes.values()),
+        "maletero": partes["maletero"],
+        "asientos": partes["asiento"],
+        "otros": partes["otro"],
+        "completo": completo,
+    }
+
+
+def imprimir_resumen_almacenamiento(vehiculos, todos):
+    """Diagnóstico del almacenamiento para revisar la clasificación."""
+    ficticios = Counter()
     for v in vehiculos:
         for c in todos[v["_full_id"]]:
-            reg = censo.setdefault(c["pieza"], {"n": 0, "alm": 0, "origen": Counter(), "caps": []})
-            reg["n"] += 1
-            if c["almacenamiento"]:
-                reg["alm"] += 1
-            reg["origen"][c["origen"]] += 1
-            if c["capacidad"] is not None:
-                reg["caps"].append(c["capacidad"])
-            if c["contentType"]:
-                tipos_contenido[(c["pieza"], c["contentType"])] += 1
+            if c["ficticio"]:
+                ficticios[c["pieza"]] += 1
+    print("Piezas ficticias ignoradas (itemType = nil y sin capacidad):", dict(ficticios.most_common(8)))
 
-    print("Censo de contenedores (pieza: vehículos | cuentan como almacenamiento | origen | rango):")
-    ordenado = sorted(censo.items(), key=lambda kv: -kv[1]["n"])
-    for pieza, reg in ordenado[:40]:
-        rango = f"{min(reg['caps'])}-{max(reg['caps'])}" if reg["caps"] else "-"
-        origenes = ", ".join(f"{o} {n}" for o, n in reg["origen"].most_common())
-        print(f"  {pieza}: {reg['n']} | almacenamiento {reg['alm']} | {origenes} | rango {rango}")
-    if len(ordenado) > 40:
-        print(f"  ... y {len(ordenado) - 40} piezas más")
-    print("Contenedores con contentType:", dict(tipos_contenido.most_common(10)))
+    incompletos = [v for v in vehiculos if not v["almacenamiento"]["completo"]]
+    print(f"Almacenamiento completo: {len(vehiculos) - len(incompletos)} | "
+          f"con algún contenedor sin dato: {len(incompletos)}")
+    sin_dato = []
+    for v in incompletos:
+        for c in v["contenedores"]:
+            if c["capacidad"] is None and categoria_contenedor(c["pieza"]) != "conductor":
+                sin_dato.append((v["_name"], c["pieza"]))
+    print("  Piezas sin dato más frecuentes:", dict(Counter(p for _, p in sin_dato).most_common(8)))
+    print("  Ejemplos (vehículo, pieza):", sin_dato[:8])
+
+    sin_maletero = [v for v in vehiculos if v["almacenamiento"]["maletero"] == 0]
+    print(f"Vehículos sin maletero detectado: {len(sin_maletero)}")
+    for v in sin_maletero[:10]:
+        print("  ", v["_full_id"], [c["pieza"] for c in v["contenedores"]])
+
+    por_categoria = {"maletero": Counter(), "otro": Counter()}
+    for v in vehiculos:
+        for c in v["contenedores"]:
+            categoria = categoria_contenedor(c["pieza"])
+            if categoria in por_categoria:
+                por_categoria[categoria][c["pieza"]] += 1
+    print("Piezas contadas como maletero (más frecuentes):", dict(por_categoria["maletero"].most_common(15)))
+    print("Piezas contadas como 'otros' (más frecuentes):", dict(por_categoria["otro"].most_common(30)))
 
 
 def procesar_vanilla(carpeta_media):
@@ -682,7 +746,7 @@ def main():
         remolques = [(v, motivo) for v, motivo in marcados if motivo]
         vehiculos = [v for v, motivo in marcados if not motivo]
 
-    # Contenedores de cada vehículo final.
+    # Contenedores y almacenamiento de cada vehículo final.
     items = cargar_items(ruta_salida.parent)
     todos_contenedores = calcular_contenedores(unicos, vehiculos, items)
     for v in vehiculos:
@@ -691,6 +755,7 @@ def main():
             for c in todos_contenedores[v["_full_id"]]
             if c["almacenamiento"]
         ]
+        v["almacenamiento"] = resumir_almacenamiento(v["contenedores"])
 
     for v in vehiculos:
         for campo in ("_plantilla", "_hereda_de", "_inclusiones", "_piezas"):
@@ -723,20 +788,14 @@ def main():
     print(f"Vehículos de mods con imagen de preview: {len(con_preview)} de {len(de_mods)}")
 
     print()
-    con_almacen = [v for v in vehiculos if v["contenedores"]]
-    sin_capacidad = [v for v in con_almacen if any(c["capacidad"] is None for c in v["contenedores"])]
-    print(f"Vehículos con algún contenedor de almacenamiento: {len(con_almacen)} de {len(vehiculos)}")
-    print(f"  Con alguna capacidad sin resolver: {len(sin_capacidad)}")
-    print("  Ejemplos:", [v["_full_id"] for v in sin_capacidad[:8]])
-    print("Ejemplos de contenedores (pieza, capacidad, origen):")
-    for nombre in ("SportsCar", "70barracuda", "StepVan_Cereal", "PickUpTruckLightsFossoil"):
+    print("Ejemplos de almacenamiento:")
+    for nombre in ("SportsCar", "70barracuda", "StepVan_Cereal", "91range", "86oshkoshKYFD"):
         for v in vehiculos:
             if v["_name"] == nombre:
-                detalle = [(c["pieza"], c["capacidad"], c["origen"]) for c in v["contenedores"]]
-                print(f"  {nombre} (mechanicType {v['stats'].get('mechanicType')}, asientos {v['stats'].get('seats')}): {detalle}")
+                print(f"  {nombre}: {v['almacenamiento']}")
                 break
     print()
-    imprimir_censo(vehiculos, todos_contenedores)
+    imprimir_resumen_almacenamiento(vehiculos, todos_contenedores)
     print(f"Guardado: {ruta_salida}")
 
 

@@ -172,15 +172,34 @@ def construir_embed(item):
 
 
 # Estadísticas de vehículo que se muestran, en este orden. Solo aparecen
-# las que el vehículo tenga definidas.
+# las que el vehículo tenga definidas. La calidad y el ruido del motor
+# siguen en vehicles.json, pero no se muestran.
 ESTADISTICAS_VEHICULO = [
     ("engineForce", "Fuerza del motor"),
     ("maxSpeed", "Velocidad máx."),
-    ("mass", "Masa"),
+    ("mass", "Peso"),
     ("seats", "Asientos"),
-    ("engineQuality", "Calidad del motor"),
-    ("engineLoudness", "Ruido del motor"),
 ]
+
+
+def texto_almacenamiento(vehiculo):
+    """Texto del campo Almacenamiento: total y desglose, por ejemplo
+    '55 (maletero 30 + asientos 20 + otros 5)'. Lleva '≥' delante si algún
+    contenedor no tiene capacidad conocida. Devuelve None si no hay datos."""
+    alm = vehiculo.get("almacenamiento")
+    if not alm or not alm.get("total"):
+        return None
+
+    partes = []
+    if alm.get("maletero"):
+        partes.append(f"maletero {alm['maletero']:g}")
+    if alm.get("asientos"):
+        partes.append(f"asientos {alm['asientos']:g}")
+    if alm.get("otros"):
+        partes.append(f"otros {alm['otros']:g}")
+
+    prefijo = "" if alm.get("completo", True) else "≥ "
+    return f"{prefijo}{alm['total']:g} ({' + '.join(partes)})"
 
 
 def construir_embed_vehiculo(vehiculo):
@@ -189,13 +208,25 @@ def construir_embed_vehiculo(vehiculo):
     embed.add_field(name="Origen", value=origen(vehiculo), inline=True)
 
     stats = vehiculo.get("stats", {})
+    mostradas = 0
     for clave, etiqueta in ESTADISTICAS_VEHICULO:
         if clave in stats:
             embed.add_field(name=etiqueta, value=f"{stats[clave]:g}", inline=True)
+            mostradas += 1
 
     notas = []
-    if stats:
-        notas.append("Valores internos del juego, sin unidades reales")
+
+    # Almacenamiento: maletero + asientos (sin el del conductor) + otros
+    # contenedores (guantera, baca, cajones extras...).
+    almacenamiento = texto_almacenamiento(vehiculo)
+    if almacenamiento:
+        embed.add_field(name="Almacenamiento", value=almacenamiento, inline=False)
+        mostradas += 1
+        if not vehiculo["almacenamiento"].get("completo", True):
+            notas.append("≥: algún contenedor sin dato de capacidad")
+
+    if mostradas:
+        notas.insert(0, "Valores internos del juego, sin unidades reales")
 
     # La imagen es el preview.png del mod: la portada del mod, no
     # necesariamente una foto de este vehículo concreto.
