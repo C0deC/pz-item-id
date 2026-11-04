@@ -20,9 +20,20 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
   nombre del archivo.
 - Idiomas: inglés (nombre principal) y los mismos 10 soportados para items.
 - Estadísticas ("stats"): mass, engineForce, engineQuality, engineLoudness,
-  maxSpeed y seats, leídas SOLO del nivel superior del vehículo (se ignoran
-  los bloques anidados: model, skin, wheel, part...). Son valores internos
-  del juego, sin unidades reales.
+  maxSpeed, seats y mechanicType, leídas SOLO del nivel superior del
+  vehículo (se ignoran los bloques anidados: model, skin, wheel, part...).
+  Son valores internos del juego, sin unidades reales.
+- Contenedores ("contenedores"): para cada vehículo se leen sus piezas
+  (`part Nombre { ... container { ... } }`), siguiendo las inclusiones de
+  plantillas (`template = Trunk/part/TruckBed`), las sobrescrituras del
+  propio vehículo (incluido el comodín `part Seat*`) y la herencia
+  `template!`. La capacidad de cada contenedor sale de:
+    1. un `capacity` escrito en su bloque container ("script"), o si no
+    2. el MaxCapacity del item de la pieza ("item"): itemType + mechanicType
+       del vehículo, por ejemplo Base.SmallTrunk + 3 -> Base.SmallTrunk3.
+  Los contenedores de combustible o aire (los que tienen contentType, el
+  depósito y los neumáticos) no cuentan como almacenamiento. Necesita
+  data/items.json y data/items_mods.json junto a la salida.
 - Imagen: para los vehículos de mods se copia el preview.png del mod (el
   indicado en 'poster=' de mod.info) a data/vehicle_previews/, reducido a
   un máximo de 512 px. Es la portada del mod, no una foto de cada vehículo.
@@ -32,9 +43,7 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
 - Remolques: con REMOLQUES = False se excluyen; con REMOLQUES = True se
   incluyen. Se considera remolque al vehículo que (1) no tiene engineForce o
   asientos, (2) tiene un nombre de script que empieza por "Trailer", o
-  (3) tiene un nombre en inglés que contiene "trailer". Los remolques de
-  vanilla y de mods heredan motor y asientos genéricos, por eso no basta
-  con mirar las estadísticas.
+  (3) tiene un nombre en inglés que contiene "trailer".
 
 Uso:
     python tools/parse_vehicles.py <media_vanilla> <workshop_content_108600> <salida.json>
@@ -43,6 +52,7 @@ Uso:
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from PIL import Image
@@ -52,6 +62,12 @@ VEHICLE_RE = re.compile(r"^[ \t]*(template[ \t]+)?vehicle[ \t]+([A-Za-z0-9_]+)\s
 MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
 NOMBRE_RE = re.compile(r'^\s*"?IGUI_VehicleName([A-Za-z0-9_]+)"?\s*[=:]\s*"?(.*?)"?\s*,?\s*$')
 VERSION_DIR_RE = re.compile(r"^\d+(\.\d+)*$")
+
+# Bloques dentro de un vehículo o plantilla.
+PIEZA_RE = re.compile(r"^[ \t]*part[ \t]+([^\s{]+)\s*\{", re.MULTILINE)
+CONTENEDOR_RE = re.compile(r"^[ \t]*container\s*\{", re.MULTILINE)
+# 'template = X' o 'template = X/part/Pieza'. No casa con 'template! = X'.
+INCLUSION_RE = re.compile(r"^[ \t]*template[ \t]*=[ \t]*([^\s,]+)", re.MULTILINE)
 
 IDIOMAS = {"EN", "ES", "ES_CL", "ES_MX", "FR", "DE", "IT", "PT", "RU", "PL", "NL"}
 
@@ -66,8 +82,13 @@ SUFIJOS_ANTIGUOS = ("Burnt", "SmashedFront", "SmashedRear", "SmashedLeft", "Smas
 # Remolques: True = incluirlos en la lista, False = excluirlos.
 REMOLQUES = False
 
+# Piezas con contenedor que no guardan objetos (combustible, aire, batería).
+PIEZAS_NO_ALMACENAMIENTO = ("GasTank", "Tire", "Battery")
+
 # Propiedades del nivel superior del vehículo que se guardan en "stats".
-CAMPOS_ESTADISTICAS = ("mass", "engineForce", "engineQuality", "engineLoudness", "maxSpeed", "seats")
+CAMPOS_ESTADISTICAS = (
+    "mass", "engineForce", "engineQuality", "engineLoudness", "maxSpeed", "seats", "mechanicType",
+)
 
 TAMANO_MAX_PREVIEW = 512
 
@@ -106,6 +127,19 @@ def buscar_cierre(texto, indice_apertura):
     return -1
 
 
+def profundidades(texto):
+    """Lista con la profundidad de llaves en cada posición del texto."""
+    resultado = []
+    d = 0
+    for c in texto:
+        if c == "}":
+            d -= 1
+        resultado.append(d)
+        if c == "{":
+            d += 1
+    return resultado
+
+
 def propiedades_nivel_superior(cuerpo):
     """Devuelve {clave: valor} de las líneas 'clave = valor' que están
     directamente dentro del vehículo, ignorando el contenido de los bloques
@@ -134,14 +168,51 @@ def propiedades_nivel_superior(cuerpo):
 def a_numero(valor):
     """Convierte '120.0' en 120 y '0.8' en 0.8. Devuelve None si no es un número."""
     try:
-        n = float(valor.strip().rstrip("fF"))
+        n = float(str(valor).strip().rstrip("fF"))
     except ValueError:
         return None
     return int(n) if n == int(n) else n
 
 
+def analizar_cuerpo(cuerpo):
+    """Devuelve (inclusiones, piezas) del nivel superior de un vehículo o plantilla.
+    - inclusiones: lista de 'Plantilla' o 'Plantilla/part/Pieza' (líneas 'template = ...').
+    - piezas: lista de (nombre, propiedades, contenedor) de los bloques
+      'part Nombre { ... }'. 'contenedor' es el diccionario de propiedades de su
+      bloque 'container', o None si la pieza no tiene."""
+    prof = profundidades(cuerpo)
+
+    inclusiones = [m.group(1) for m in INCLUSION_RE.finditer(cuerpo) if prof[m.start()] == 0]
+
+    piezas = []
+    for m in PIEZA_RE.finditer(cuerpo):
+        if prof[m.start()] != 0:
+            continue
+        abre = m.end() - 1
+        cierra = buscar_cierre(cuerpo, abre)
+        if cierra < 0:
+            continue
+        bloque = cuerpo[abre + 1:cierra]
+        props = propiedades_nivel_superior(bloque)
+
+        contenedor = None
+        prof_bloque = profundidades(bloque)
+        for mc in CONTENEDOR_RE.finditer(bloque):
+            if prof_bloque[mc.start()] != 0:
+                continue
+            abre_c = mc.end() - 1
+            cierra_c = buscar_cierre(bloque, abre_c)
+            if cierra_c >= 0:
+                contenedor = propiedades_nivel_superior(bloque[abre_c + 1:cierra_c])
+            break
+        piezas.append((m.group(1), props, contenedor))
+
+    return inclusiones, piezas
+
+
 def vehiculos_de_archivo(ruta):
-    """Devuelve una lista de (modulo, nombre_script, propiedades, es_plantilla)."""
+    """Devuelve una lista de (modulo, nombre_script, propiedades, es_plantilla,
+    inclusiones, piezas)."""
     texto = quitar_comentarios(ruta.read_text(encoding="utf-8", errors="replace"))
     encontrados = []
 
@@ -161,8 +232,10 @@ def vehiculos_de_archivo(ruta):
             cierra_v = buscar_cierre(cuerpo, m.end() - 1)
             if cierra_v < 0:
                 break
-            props = propiedades_nivel_superior(cuerpo[m.end():cierra_v])
-            encontrados.append((modulo, m.group(2), props, m.group(1) is not None))
+            cuerpo_v = cuerpo[m.end():cierra_v]
+            props = propiedades_nivel_superior(cuerpo_v)
+            inclusiones, piezas = analizar_cuerpo(cuerpo_v)
+            encontrados.append((modulo, m.group(2), props, m.group(1) is not None, inclusiones, piezas))
             pos = cierra_v + 1  # salta el contenido del vehículo (partes, modelos...)
 
     return encontrados
@@ -244,7 +317,7 @@ def copiar_preview(carpeta_mod, carpeta_version, carpeta_common, poster, carpeta
 
 def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
     entradas = []
-    for modulo, nombre_script, props, es_plantilla in pares:
+    for modulo, nombre_script, props, es_plantilla, inclusiones, piezas in pares:
         por_idioma = nombres.get(nombre_script, {})
 
         stats = {}
@@ -264,6 +337,8 @@ def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
             "_preview": None,
             "_plantilla": es_plantilla,
             "_hereda_de": props.get("template!"),
+            "_inclusiones": inclusiones,
+            "_piezas": piezas,
             "DisplayName": por_idioma.get("EN"),
             "_translations": {i: n for i, n in por_idioma.items() if i != "EN"},
             "stats": stats,
@@ -271,30 +346,38 @@ def construir_entradas(pares, nombres, origen, nombre_origen, archivo):
     return entradas
 
 
+def indexar(entradas):
+    """Devuelve ({id: vehículo}, {id: plantilla})."""
+    vehiculos = {e["_full_id"]: e for e in entradas if not e["_plantilla"]}
+    plantillas = {e["_full_id"]: e for e in entradas if e["_plantilla"]}
+    return vehiculos, plantillas
+
+
+def buscar_padre(e, vehiculos, plantillas):
+    """Busca el vehículo o plantilla del que hereda `e` con 'template!'.
+    Un vehículo puede llamarse igual que la plantilla de la que hereda
+    (vehicle StepVan con template! = StepVan). Se descarta el propio
+    elemento para que encuentre la plantilla y no se tome a sí mismo."""
+    ref = e["_hereda_de"]
+    id_padre = ref if "." in ref else f"{e['_module']}.{ref}"
+    for candidato in (vehiculos.get(id_padre), plantillas.get(id_padre)):
+        if candidato is not None and candidato is not e:
+            return candidato
+    return None
+
+
 def resolver_herencia(entradas):
     """Rellena las estadísticas que faltan con las del vehículo (o plantilla)
     del que se hereda mediante 'template! = Nombre'. Lo que el vehículo define
     por sí mismo tiene prioridad sobre lo heredado.
     Devuelve (vehiculos_que_ganan_engineForce, referencias_sin_resolver)."""
-    vehiculos = {e["_full_id"]: e for e in entradas if not e["_plantilla"]}
-    plantillas = {e["_full_id"]: e for e in entradas if e["_plantilla"]}
-
-    def buscar_padre(e):
-        ref = e["_hereda_de"]
-        id_padre = ref if "." in ref else f"{e['_module']}.{ref}"
-        # Un vehículo puede llamarse igual que la plantilla de la que hereda
-        # (vehicle StepVan con template! = StepVan). Se descarta el propio
-        # elemento para que encuentre la plantilla y no se tome a sí mismo.
-        for candidato in (vehiculos.get(id_padre), plantillas.get(id_padre)):
-            if candidato is not None and candidato is not e:
-                return candidato
-        return None
+    vehiculos, plantillas = indexar(entradas)
 
     def stats_completas(e, visitados):
         stats = dict(e["stats"])
         if not e["_hereda_de"] or e["_full_id"] in visitados:
             return stats
-        padre = buscar_padre(e)
+        padre = buscar_padre(e, vehiculos, plantillas)
         if padre is None:
             return stats
         for campo, valor in stats_completas(padre, visitados | {e["_full_id"]}).items():
@@ -306,7 +389,7 @@ def resolver_herencia(entradas):
     for e in entradas:
         if not e["_hereda_de"]:
             continue
-        if buscar_padre(e) is None:
+        if buscar_padre(e, vehiculos, plantillas) is None:
             if not e["_plantilla"]:
                 sin_resolver.append((e["_full_id"], e["_hereda_de"]))
             continue
@@ -315,6 +398,186 @@ def resolver_herencia(entradas):
         if not tenia_motor and "engineForce" in e["stats"]:
             ganan_motor += 1
     return ganan_motor, sin_resolver
+
+
+def cargar_items(carpeta_data):
+    """Carga items.json e items_mods.json (si existen) como {full_id: item}."""
+    items = {}
+    for nombre in ("items.json", "items_mods.json"):
+        ruta = carpeta_data / nombre
+        if not ruta.exists():
+            print(f"AVISO: no existe {ruta}; las capacidades que dependen de items no se podrán resolver")
+            continue
+        for it in json.loads(ruta.read_text(encoding="utf-8")):
+            items[it["_full_id"]] = it
+    return items
+
+
+def capacidad_de(info, mecanica, items):
+    """Devuelve (capacidad, origen) de un contenedor ya resuelto.
+    origen: 'script' si el container declara capacity; 'item' si sale del
+    MaxCapacity del item de la pieza (itemType + mechanicType); 'sin dato'
+    si no se puede resolver."""
+    cont = info["contenedor"]
+    if "capacity" in cont:
+        numero = a_numero(cont["capacity"])
+        if numero is not None:
+            return numero, "script"
+
+    tipo = info["props"].get("itemType")
+    if tipo and mecanica is not None:
+        item = items.get(f"{tipo}{mecanica}")
+        if item and "MaxCapacity" in item:
+            valor = item["MaxCapacity"]
+            valor = valor[0] if isinstance(valor, list) else valor
+            numero = a_numero(valor)
+            if numero is not None:
+                return numero, "item"
+
+    return None, "sin dato"
+
+
+def calcular_contenedores(entradas, objetivos, items):
+    """Para cada vehículo de `objetivos` devuelve la lista de sus contenedores:
+    {pieza, capacidad, origen, almacenamiento, contentType}. Se resuelven las
+    piezas siguiendo, en este orden: la herencia 'template!', las inclusiones
+    de plantillas ('template = X' o 'template = X/part/Pieza') y las piezas
+    propias del vehículo (el comodín 'part Seat*' se aplica a todas las
+    piezas cuyo nombre empiece igual)."""
+    vehiculos, plantillas = indexar(entradas)
+    cache = {}
+
+    def copiar(info):
+        return {
+            "props": dict(info["props"]),
+            "contenedor": None if info["contenedor"] is None else dict(info["contenedor"]),
+        }
+
+    def fusionar(base, nuevo):
+        base["props"].update(nuevo["props"])
+        if nuevo["contenedor"] is not None:
+            if base["contenedor"] is None:
+                base["contenedor"] = {}
+            base["contenedor"].update(nuevo["contenedor"])
+
+    def fusionar_en(exactas, nombre, info):
+        if nombre not in exactas:
+            exactas[nombre] = {"props": {}, "contenedor": None}
+        fusionar(exactas[nombre], info)
+
+    def con_comodines(nombre, info, comodines):
+        """Aplica primero los comodines que casan con `nombre` y encima la pieza."""
+        base = {"props": {}, "contenedor": None}
+        for prefijo, c in comodines:
+            if nombre.startswith(prefijo):
+                fusionar(base, c)
+        fusionar(base, info)
+        return base
+
+    def buscar_plantilla(e, nombre):
+        id_t = nombre if "." in nombre else f"{e['_module']}.{nombre}"
+        for candidato in (plantillas.get(id_t), vehiculos.get(id_t)):
+            if candidato is not None and candidato is not e:
+                return candidato
+        return None
+
+    def resolver(e, visitados):
+        clave = (e["_full_id"], e["_plantilla"])
+        if clave in cache:
+            return cache[clave]
+        if clave in visitados:
+            return {"exactas": {}, "comodines": []}
+        visitados = visitados | {clave}
+
+        exactas = {}
+        comodines = []
+
+        if e["_hereda_de"]:
+            padre = buscar_padre(e, vehiculos, plantillas)
+            if padre is not None:
+                rp = resolver(padre, visitados)
+                exactas = {n: copiar(i) for n, i in rp["exactas"].items()}
+                comodines = [(p, copiar(i)) for p, i in rp["comodines"]]
+
+        for inclusion in e["_inclusiones"]:
+            nombre_t, _, pieza = inclusion.partition("/part/")
+            t = buscar_plantilla(e, nombre_t)
+            if t is None:
+                continue
+            rt = resolver(t, visitados)
+            if pieza:
+                if pieza in rt["exactas"]:
+                    fusionar_en(exactas, pieza, con_comodines(pieza, rt["exactas"][pieza], rt["comodines"]))
+            else:
+                for n, i in rt["exactas"].items():
+                    fusionar_en(exactas, n, con_comodines(n, i, rt["comodines"]))
+                comodines.extend((p, copiar(i)) for p, i in rt["comodines"])
+
+        for nombre, props, cont in e["_piezas"]:
+            info = {"props": props, "contenedor": cont}
+            if nombre.endswith("*"):
+                prefijo = nombre[:-1]
+                for n in exactas:
+                    if n.startswith(prefijo):
+                        fusionar(exactas[n], info)
+                comodines.append((prefijo, copiar(info)))
+            else:
+                if nombre not in exactas:
+                    vacia = {"props": {}, "contenedor": None}
+                    fusionar_en(exactas, nombre, con_comodines(nombre, vacia, comodines))
+                fusionar(exactas[nombre], info)
+
+        resultado = {"exactas": exactas, "comodines": comodines}
+        cache[clave] = resultado
+        return resultado
+
+    salida = {}
+    for e in objetivos:
+        mecanica = e["stats"].get("mechanicType")
+        contenedores = []
+        for nombre, info in resolver(e, set())["exactas"].items():
+            cont = info["contenedor"]
+            if cont is None:
+                continue
+            capacidad, origen = capacidad_de(info, mecanica, items)
+            contenedores.append({
+                "pieza": nombre,
+                "capacidad": capacidad,
+                "origen": origen,
+                "contentType": cont.get("contentType"),
+                "almacenamiento": "contentType" not in cont
+                                  and not nombre.startswith(PIEZAS_NO_ALMACENAMIENTO),
+            })
+        salida[e["_full_id"]] = contenedores
+    return salida
+
+
+def imprimir_censo(vehiculos, todos):
+    """Resumen de las piezas con contenedor de los vehículos finales, para
+    decidir qué cuenta como almacenamiento."""
+    censo = {}
+    tipos_contenido = Counter()
+    for v in vehiculos:
+        for c in todos[v["_full_id"]]:
+            reg = censo.setdefault(c["pieza"], {"n": 0, "alm": 0, "origen": Counter(), "caps": []})
+            reg["n"] += 1
+            if c["almacenamiento"]:
+                reg["alm"] += 1
+            reg["origen"][c["origen"]] += 1
+            if c["capacidad"] is not None:
+                reg["caps"].append(c["capacidad"])
+            if c["contentType"]:
+                tipos_contenido[(c["pieza"], c["contentType"])] += 1
+
+    print("Censo de contenedores (pieza: vehículos | cuentan como almacenamiento | origen | rango):")
+    ordenado = sorted(censo.items(), key=lambda kv: -kv[1]["n"])
+    for pieza, reg in ordenado[:40]:
+        rango = f"{min(reg['caps'])}-{max(reg['caps'])}" if reg["caps"] else "-"
+        origenes = ", ".join(f"{o} {n}" for o, n in reg["origen"].most_common())
+        print(f"  {pieza}: {reg['n']} | almacenamiento {reg['alm']} | {origenes} | rango {rango}")
+    if len(ordenado) > 40:
+        print(f"  ... y {len(ordenado) - 40} piezas más")
+    print("Contenedores con contentType:", dict(tipos_contenido.most_common(10)))
 
 
 def procesar_vanilla(carpeta_media):
@@ -419,9 +682,19 @@ def main():
         remolques = [(v, motivo) for v, motivo in marcados if motivo]
         vehiculos = [v for v, motivo in marcados if not motivo]
 
+    # Contenedores de cada vehículo final.
+    items = cargar_items(ruta_salida.parent)
+    todos_contenedores = calcular_contenedores(unicos, vehiculos, items)
     for v in vehiculos:
-        v.pop("_plantilla", None)
-        v.pop("_hereda_de", None)
+        v["contenedores"] = [
+            {"pieza": c["pieza"], "capacidad": c["capacidad"], "origen": c["origen"]}
+            for c in todos_contenedores[v["_full_id"]]
+            if c["almacenamiento"]
+        ]
+
+    for v in vehiculos:
+        for campo in ("_plantilla", "_hereda_de", "_inclusiones", "_piezas"):
+            v.pop(campo, None)
 
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
     with open(ruta_salida, "w", encoding="utf-8") as f:
@@ -439,8 +712,6 @@ def main():
     print(f"Excluidos por no funcionales: {len(excluidos_lista)}")
     print(f"  Excluidos solo por la regla ampliada: {len(solo_regla_ampliada)}")
     print(f"Remolques {'incluidos' if REMOLQUES else 'excluidos'} (REMOLQUES = {REMOLQUES}): {len(remolques)}")
-    for v, motivo in remolques:
-        print(f"  {v['_full_id']} | {v['_source']} | {motivo}")
     print(f"Con nombre en inglés: {len(vehiculos) - len(sin_nombre)}")
     print(f"Sin nombre en inglés: {len(sin_nombre)}")
     print(f"Herencia 'template!': {ganan_motor} vehículos ganan engineForce")
@@ -450,6 +721,22 @@ def main():
         n = sum(1 for v in vehiculos if campo in v["stats"])
         print(f"  {campo}: {n} de {len(vehiculos)}")
     print(f"Vehículos de mods con imagen de preview: {len(con_preview)} de {len(de_mods)}")
+
+    print()
+    con_almacen = [v for v in vehiculos if v["contenedores"]]
+    sin_capacidad = [v for v in con_almacen if any(c["capacidad"] is None for c in v["contenedores"])]
+    print(f"Vehículos con algún contenedor de almacenamiento: {len(con_almacen)} de {len(vehiculos)}")
+    print(f"  Con alguna capacidad sin resolver: {len(sin_capacidad)}")
+    print("  Ejemplos:", [v["_full_id"] for v in sin_capacidad[:8]])
+    print("Ejemplos de contenedores (pieza, capacidad, origen):")
+    for nombre in ("SportsCar", "70barracuda", "StepVan_Cereal", "PickUpTruckLightsFossoil"):
+        for v in vehiculos:
+            if v["_name"] == nombre:
+                detalle = [(c["pieza"], c["capacidad"], c["origen"]) for c in v["contenedores"]]
+                print(f"  {nombre} (mechanicType {v['stats'].get('mechanicType')}, asientos {v['stats'].get('seats')}): {detalle}")
+                break
+    print()
+    imprimir_censo(vehiculos, todos_contenedores)
     print(f"Guardado: {ruta_salida}")
 
 

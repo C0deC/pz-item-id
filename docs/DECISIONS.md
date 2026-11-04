@@ -215,15 +215,29 @@ updates. A project placed inside could be lost without warning.
 
 ---
 
-## Bot scope: two separate commands
+## Bot scope: four commands
 
-**Decision:** `/getid` returns only the ID; `/getinfo` returns the full card
-(name, image, type, category, source).
+**Decision:** two pairs of commands, one for items and one for vehicles.
+Within each pair, the `...id` command returns only the ID and the `...info`
+command returns the full card.
 
-**Why:** different use cases — quickly copying an ID for an admin command,
-versus looking up an item's full details. A single command that always
-showed everything would be slower to use for the most common case (just the
-ID).
+| Command | Returns |
+|---|---|
+| `/getitemid` | the item's full ID |
+| `/getiteminfo` | name, ID, type, category, origin, icon |
+| `/getvehicleid` | the vehicle's full ID |
+| `/getvehicleinfo` | name, ID, origin, engine stats, mod cover image |
+
+**Why ID and info are separate:** different use cases — quickly copying an ID
+for an admin command, versus looking up the full details. A single command
+that always showed everything would be slower to use for the most common case
+(just the ID).
+
+**Why items and vehicles are separate:** they have different data and
+different IDs, and mixing ~11,000 items with ~600 vehicles in one search
+would flood the dropdown with irrelevant results. The commands were first
+called `/getid` and `/getinfo` (and `/getvehicle` for vehicles) and were
+renamed so that the item/vehicle split is explicit in the command name.
 
 ---
 
@@ -257,6 +271,125 @@ too, and it looked like "mod items are private" because mods more often fall
 into the multiple-match path. The chosen item is now sent as a **new public
 message**.
 
+**ID shown under each dropdown option:** several results can have exactly
+the same name (for example, the front and rear doors of a vehicle mod are
+both called "Door"). Each option therefore shows its full ID as a
+description, so they can be told apart.
+
+---
+
+## Vehicles: where the data comes from
+
+**Decision:** read vehicles from the same game and mod files as the items,
+with a dedicated script (`tools/parse_vehicles.py`) that handles vanilla and
+mods in one run.
+
+**Where they are:**
+- Vanilla: `media/scripts/generated/vehicles/` (not `scripts/vehicles/`; the
+  folder name was found by searching, not assumed). The dedicated server has
+  them, unlike the UI textures.
+- Mods: `media/scripts/` inside the latest version folder and `common/`, as
+  for items.
+
+**ID:** `Module.ScriptName`, the same format as items (e.g.
+`Base.70barracuda`). Mod vehicles also live in `module Base`.
+
+**Readable name:** the script has no name. It is in the translations, under
+the key `IGUI_VehicleName<ScriptName>` (e.g. `IGUI_VehicleName70barracuda`).
+Vanilla uses JSON translation files, but some mods still use the legacy
+`.txt` format (`key = "value"`, sometimes with a missing closing quote), so
+the script reads both formats and tolerates the broken quote. Languages are
+the same 10 supported for items.
+
+**Vehicles with no English name:** 21 (mostly delivery-van liveries). They are
+found by their script name instead, and the dropdown shows their ID.
+
+---
+
+## Vehicle inheritance (`template!`)
+
+**Problem:** the first run left 171 vehicles with no engine data. Looking at
+one (`PickUpTruckLightsFossoil`) showed why: it declares
+`template! = PickUpTruckLights` and only overrides the texture, model and
+seats. Everything else is inherited.
+
+**Decision:** copy the missing stats from the parent vehicle (or from a
+`template vehicle` block), following the chain if the parent also inherits.
+What a vehicle defines itself always wins over what it inherits. The 2,843
+`template vehicle` blocks are read only as a data source and never appear in
+the final list.
+
+**A bug worth remembering:** a vehicle can have the same name as the template
+it inherits from (`vehicle StepVan` inheriting `template! = StepVan`). The
+first version looked the parent up by name, found the vehicle itself, and the
+chain stopped there, leaving 46 vans without an engine. The fix is to skip
+the element itself when looking for its parent, so it falls through to the
+template.
+
+**Result:** 231 vehicles gained their engine data through inheritance, and
+there are no unresolved `template!` references.
+
+---
+
+## Vehicle stats and image
+
+**Stats:** `engineForce`, `maxSpeed`, `mass`, `seats`, `engineQuality` and
+`engineLoudness` are read from the top level of the vehicle block and saved in
+`vehicles.json`. Nested blocks (model, skin, wheels, parts) contain their own
+`key = value` lines and would otherwise overwrite the real values.
+
+**What the card shows:** only engine force, max speed, weight (the `mass`
+value, labelled "Peso" in the card) and seats. Engine quality and engine
+loudness are still in the data but were taken out of the card on purpose:
+they are not useful when looking up a vehicle.
+
+**They are not horsepower.** They are the game's internal values with no real
+units, so the embed calls the first one "engine force" and adds a footer
+saying so. They are useful to compare vehicles with each other.
+
+**Image:** there is no picture of each individual vehicle in the game files.
+The `ui/vehicles` folder of the mod examined only held a mechanics overlay,
+and the vanilla icons with "vehicle" in their name are UI elements (fuel and
+engine gauges, slot icons). The `Shell` textures are the paint map of the 3D
+model, not a picture of the vehicle.
+
+**Decision:** for vehicles from a mod, use the mod's own `preview.png` (the
+one named in `poster=` in `mod.info`), shrunk to 512 px and stored once per
+mod in `data/vehicle_previews/`. Vanilla vehicles get no image. The embed
+footer says "Image: mod cover" because in a mod with several vehicles the
+cover may show a different one.
+
+---
+
+## Vehicles left out of the list
+
+**Non-functional wrecks.** Burnt and smashed vehicles are excluded: any
+script name containing `burnt` or `smashed`, ignoring case. The first
+version only checked the end of the name and missed `NormalCarBurntPolice`.
+89 vehicles are excluded.
+
+**Trailers (for now).** Excluded on purpose, with a switch at the top of
+`parse_vehicles.py` (`REMOLQUES = False`; set it to `True` to include them in
+a later update). A vehicle is treated as a trailer when:
+1. it has no engine force or no seats, or
+2. its script name starts with `Trailer`, or
+3. its English name contains "trailer".
+
+**Why a name rule is needed:** the first rule alone only caught the 9
+vehicles of the `isoContainers` mod. All other trailers, vanilla and mods,
+inherit an engine value and seats from their template (for example 3,600 and
+2 seats; the `KI5campers` caravans have 10 and 4 to 7 seats), so they look
+like ordinary vehicles in the stats. 37 vehicles are excluded in total. The Dodge Caravan minivans are cars and stay.
+
+**Safety net:** the script prints every excluded trailer with the reason, so
+the list can be checked by eye after each run.
+
+**Result:** 595 vehicles (152 vanilla, 443 from mods), all with complete
+stats.
+
+**Optional file:** the bot starts without `data/vehicles.json` (it prints a
+warning), so a missing or older deployment does not stop the item commands.
+
 ---
 
 ## Out of scope (for now)
@@ -265,9 +398,13 @@ message**.
   `parse_recipes.py`, which would allow showing how an item is crafted. It
   was decided not to include this in the first version — the bot only
   reports on the item itself. Noted as a possible future feature.
+- **Trailers as vehicles:** left out on purpose and controlled by the
+  `REMOLQUES` switch; they may come back in a later update.
+- **A picture of each individual vehicle:** not available in the game files,
+  so only the mod cover is used (see above).
 - **Remaining mod icons (355 items):** see "Mod icons" above.
-- **Mod translations in older `.txt` formats:** see "Mod translations"
-  above.
+- **Mod translations in older `.txt` formats for items:** see "Mod
+  translations" above (vehicles do read both formats).
 - **Keeping the bot running 24/7** (systemd service vs screen/tmux): not
   decided or set up yet. Currently the bot is started by hand from an SSH
   session.
@@ -279,7 +416,8 @@ message**.
 ## What is (and is not) in the repository
 
 **Not versioned:** `venv/`, `.env`, everything generated in `data/`
-(vanilla and mod JSON files, icon folders), local copies of game assets
+(vanilla and mod JSON files, icon folders, `vehicles.json` and
+`vehicle_previews/`), local copies of game assets
 (`.pack` files, copyrighted), and editor files (`.vscode/`,
 `*.code-workspace`).
 

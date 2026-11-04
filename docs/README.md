@@ -1,36 +1,48 @@
 # PZ Item Bot
 
 Discord bot for the **IBEROZOID_Server** that lets you look up the internal
-ID of any Project Zomboid item, vanilla or from the Steam Workshop mods
-installed on the server, in several languages, directly from Discord.
+ID of any Project Zomboid item or vehicle, vanilla or from the Steam Workshop
+mods installed on the server, in several languages, directly from Discord.
 
 ## Commands
 
-- `/getid <name>` — returns only the full item ID (e.g. `Base.Hammer`).
-- `/getinfo <name>` — returns a full card: name, ID, type, category, origin
-  (`vanilla` or the mod's name), and the item's icon when it has one.
+**Items**
+
+- `/getitemid <name>` — returns only the full item ID (e.g. `Base.Hammer`).
+- `/getiteminfo <name>` — returns a full card: name, ID, type, category,
+  origin (`vanilla` or the mod's name), and the item's icon when it has one.
+
+**Vehicles**
+
+- `/getvehicleid <name>` — returns only the full vehicle ID
+  (e.g. `Base.70barracuda`).
+- `/getvehicleinfo <name>` — returns a card with the name, ID, origin, and
+  the engine force, max speed, weight and seats. For vehicles from a mod it
+  also shows the mod's cover image.
 
 ### How search works
 
-- The bot searches by the item's **display name** (and its translations),
-  **not** by its internal ID. Searching `Hood` works; searching
-  `92amgeneralM998EngineDoor2` does not.
+- The bot searches by the **display name** (and its translations), **not**
+  by the internal ID. Searching `Hood` works; searching
+  `92amgeneralM998EngineDoor2` does not. The few vehicles with no readable
+  name (some delivery vans) are found by their script name instead.
 - Names are matched in English and in the supported languages: ES, ES_CL,
   ES_MX, FR, DE, IT, PT, RU, PL, NL.
-- Every word you type must appear in the item's name or in its mod's name,
-  in any order. `m998 hood` finds `92 AM General M998 Hood`.
-- An exact name match returns that item directly. Otherwise, if several items
-  match, the bot shows a dropdown (up to 25 results, sorted alphabetically,
-  with a notice if there are more) and posts the chosen item publicly in the
-  channel.
+- Every word you type must appear in the name or in its mod's name, in any
+  order. `m998 hood` finds `92 AM General M998 Hood`.
+- An exact name match returns that result directly. Otherwise, if several
+  results match, the bot shows a dropdown (up to 25 results, sorted
+  alphabetically, with a notice if there are more). Each option shows its ID
+  underneath, because different items can share the same name. The chosen
+  result is posted publicly in the channel.
 - If nothing matches, the bot suggests similarly spelled names.
 
 ## Why this project exists
 
 When playing or administering a Project Zomboid server, you often need an
-item's internal ID (for example, for admin commands like `/additem`).
-Looking it up by hand on the wiki is slow; this bot resolves it instantly
-from Discord.
+item's or a vehicle's internal ID (for example, for admin commands like
+`/additem` or `/addvehicle`). Looking it up by hand on the wiki is slow; this
+bot resolves it instantly from Discord.
 
 ## Architecture
 
@@ -53,7 +65,9 @@ pz-item-id/
 │   ├── translations.json            # vanilla item name translations
 │   ├── items_mods.json              # Workshop mod items
 │   ├── icons_mods/                  # Workshop mod icons (PNG)
-│   └── translations_mods.json       # Workshop mod item name translations
+│   ├── translations_mods.json       # Workshop mod item name translations
+│   ├── vehicles.json                # vanilla + mod vehicles
+│   └── vehicle_previews/            # mod cover images, one per mod (PNG)
 ├── tools/
 │   ├── parse_items_vanilla.py       # vanilla items from media/scripts/*.txt
 │   ├── extract_packs.py             # vanilla icons from the UI .pack files
@@ -61,7 +75,8 @@ pz-item-id/
 │   ├── extract_translations.py      # vanilla item name translations
 │   ├── parse_items_mods.py          # items + loose icons from Workshop mods
 │   ├── link_icons_mods.py           # links mod items to their icons
-│   └── extract_translations_mods.py # mod item name translations
+│   ├── extract_translations_mods.py # mod item name translations
+│   └── parse_vehicles.py            # vanilla + mod vehicles, stats, covers
 ├── docs/
 │   ├── README.md
 │   ├── ROADMAP.md
@@ -81,11 +96,12 @@ legal/technical issues of scraping — see `DECISIONS.md`).
 ## Requirements
 
 - Python 3.11+
-- For the **vanilla** data: a full Project Zomboid (build 42) client
+- For the **vanilla item icons**: a full Project Zomboid (build 42) client
   installation. A dedicated server does not include the UI texture packs, so
-  the vanilla icons cannot be generated there.
-- For the **mod** data: access to the folder where the server downloads its
-  Workshop mods (`.../steamapps/workshop/content/108600`).
+  those icons cannot be generated there.
+- For everything else (vanilla item data, mod data, vehicles): the game's
+  `media` folder and the folder where the server downloads its Workshop mods
+  (`.../steamapps/workshop/content/108600`). A dedicated server has both.
 - A bot created in the
   [Discord Developer Portal](https://discord.com/developers/applications)
 
@@ -110,7 +126,7 @@ DISCORD_TOKEN=your_token_here
 Files in `data/` are not version-controlled — they're derived data,
 generated by running these scripts in order.
 
-**Vanilla data** (needs a full game client install):
+**Vanilla item data** (the icons need a full game client install):
 
 ```bash
 python tools/parse_items_vanilla.py "<game>/media/scripts" data/items.json
@@ -122,7 +138,7 @@ python tools/link_icons.py data/items.json data/icon_index.json data/icons
 python tools/extract_translations.py "<game>/media/lua/shared/Translate" data/translations.json
 ```
 
-**Mod data** (run where the server's Workshop folder is, e.g. on
+**Mod item data** (run where the server's Workshop folder is, e.g. on
 IBEROZOID_Server):
 
 ```bash
@@ -136,9 +152,20 @@ python tools/extract_translations_mods.py <workshop>/content/108600 data/transla
 `link_icons_mods.py` needs `data/icon_index.json` because many mods reuse
 vanilla icons without shipping them.
 
-If the vanilla data is generated on a different machine than the one running
-the bot, copy `data/items.json`, `data/icon_index.json`, `data/icons/` and
-`data/translations.json` over (for example with WinSCP).
+**Vehicles** (vanilla and mods in one step; run it on the server):
+
+```bash
+python tools/parse_vehicles.py "<game>/media" <workshop>/content/108600 data/vehicles.json
+```
+
+It prints a summary with what it excluded and why. Two switches at the top
+of the script control what is left out: non-functional vehicles (burnt or
+smashed wrecks) are always excluded, and trailers are excluded unless
+`REMOLQUES = True`.
+
+If the vanilla item data is generated on a different machine than the one
+running the bot, copy `data/items.json`, `data/icon_index.json`,
+`data/icons/` and `data/translations.json` over (for example with WinSCP).
 
 ## Running the bot
 
@@ -149,7 +176,23 @@ python bot.py
 The bot reads every JSON file once at startup, so **restart it after
 regenerating any file in `data/`**.
 
-On startup it prints how many items it loaded (vanilla + mods).
+On startup it prints how many items (vanilla + mods) and vehicles it loaded.
+`data/vehicles.json` is optional: without it the bot starts anyway, prints a
+warning, and the vehicle commands find nothing.
+
+## Deployment on IBEROZOID_Server
+
+The server is a Linux machine managed with LinuxGSM. The bot lives in its own
+folder in the user's home directory, **outside** `serverfiles/` and
+`Zomboid/`, because LinuxGSM manages and may overwrite those on game updates.
+
+Setup is the same as the installation above, plus copying the vanilla item
+data generated on a full client (the dedicated server lacks the UI texture
+packs). The mod scripts and the vehicles are run directly on the server
+against its own game and Workshop folders.
+
+Keeping the bot running after closing the SSH session (systemd service or
+screen/tmux) is still pending — see `ROADMAP.md`.
 
 ## Known limitations
 
@@ -161,9 +204,20 @@ On startup it prints how many items it loaded (vanilla + mods).
   files are not covered.
 - Item names for mod items come from the `DisplayName` in their scripts; if a
   mod does not define one, the internal name is shown instead.
+- **Vehicle images:** there is no picture of each individual vehicle in the
+  game files. Vehicles from a mod show that mod's cover image (`preview.png`),
+  which may show a different vehicle if the mod adds several. Vanilla
+  vehicles have no image.
+- **Vehicle stats** (engine force, max speed, weight...) are the game's
+  internal values, not horsepower or km/h, so they are only useful for
+  comparing vehicles with each other.
+- **Trailers are not included** for now, and neither are burnt or smashed
+  vehicle wrecks. Trailers are detected by name and by missing engine or
+  seats, so a trailer with an unusual name could slip through.
 
 ## Current status
 
-The bot works end to end with vanilla and mod items, tested on the
-IBEROZOID_Server test machine. See `ROADMAP.md` for what is done and what is
-pending.
+Items (vanilla and mods) work end to end and were tested on the
+IBEROZOID_Server test machine. The vehicle commands are the most recent
+addition: their data generates correctly, but check them in Discord after
+each change. See `ROADMAP.md` for what is done and what is pending.
