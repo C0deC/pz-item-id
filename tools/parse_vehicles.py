@@ -29,8 +29,12 @@ Extrae los vehículos de Project Zomboid (vanilla y mods de Workshop) a un
   propio vehículo (incluido el comodín `part Seat*`) y la herencia
   `template!`. La capacidad de cada contenedor sale de:
     1. un `capacity` escrito en su bloque container ("script"), o si no
-    2. el MaxCapacity del item de la pieza ("item"): itemType + mechanicType
-       del vehículo, por ejemplo Base.SmallTrunk + 3 -> Base.SmallTrunk3.
+    2. el MaxCapacity del item de la pieza ("item"). El itemType puede ser
+       una lista separada por ';'. Para cada candidato se prueba primero
+       itemType + mechanicType del vehículo (convención de vanilla, por
+       ejemplo Base.SmallTrunk + 3 -> Base.SmallTrunk3) y después el nombre
+       tal cual (como nombran sus items algunos mods, por ejemplo
+       Base.92amgeneralM998Roofrack o USMIL.Seat0).
   No cuentan como almacenamiento: los contenedores de combustible o aire
   (los que tienen contentType, el depósito, los neumáticos y la batería) ni
   las piezas ficticias (sin capacidad y con itemType = nil: los mods
@@ -430,23 +434,35 @@ def cargar_items(carpeta_data):
 def capacidad_de(info, mecanica, items):
     """Devuelve (capacidad, origen) de un contenedor ya resuelto.
     origen: 'script' si el container declara capacity; 'item' si sale del
-    MaxCapacity del item de la pieza (itemType + mechanicType); 'sin dato'
-    si no se puede resolver."""
+    MaxCapacity del item de la pieza; 'sin dato' si no se puede resolver.
+
+    El itemType de la pieza puede ser una lista separada por ';' (ej.
+    'Base.M998CarSeat2;USMIL.Seat0'). Para cada candidato se prueba:
+      1. el nombre + el mechanicType del vehículo, que es la convención de
+         vanilla (Base.SmallTrunk + 3 -> Base.SmallTrunk3);
+      2. el nombre tal cual, que es como nombran sus items algunos mods
+         (Base.92amgeneralM998Roofrack, USMIL.Seat0).
+    Se prueba primero la convención de vanilla para no cambiar sus resultados."""
     cont = info["contenedor"]
     if "capacity" in cont:
         numero = a_numero(cont["capacity"])
         if numero is not None:
             return numero, "script"
 
-    tipo = info["props"].get("itemType")
-    if tipo and mecanica is not None:
-        item = items.get(f"{tipo}{mecanica}")
-        if item and "MaxCapacity" in item:
-            valor = item["MaxCapacity"]
-            valor = valor[0] if isinstance(valor, list) else valor
-            numero = a_numero(valor)
-            if numero is not None:
-                return numero, "item"
+    tipos = [t.strip() for t in str(info["props"].get("itemType", "")).split(";") if t.strip()]
+    for tipo in tipos:
+        candidatos = []
+        if mecanica is not None:
+            candidatos.append(f"{tipo}{mecanica}")
+        candidatos.append(tipo)
+        for nombre in candidatos:
+            item = items.get(nombre)
+            if item and "MaxCapacity" in item:
+                valor = item["MaxCapacity"]
+                valor = valor[0] if isinstance(valor, list) else valor
+                numero = a_numero(valor)
+                if numero is not None:
+                    return numero, "item"
 
     return None, "sin dato"
 
@@ -789,7 +805,7 @@ def main():
 
     print()
     print("Ejemplos de almacenamiento:")
-    for nombre in ("SportsCar", "70barracuda", "StepVan_Cereal", "91range", "86oshkoshKYFD"):
+    for nombre in ("SportsCar", "70barracuda", "StepVan_Cereal", "91range", "86oshkoshKYFD", "92amgeneralM998"):
         for v in vehiculos:
             if v["_name"] == nombre:
                 print(f"  {nombre}: {v['almacenamiento']}")
