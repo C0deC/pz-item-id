@@ -10,6 +10,11 @@ from PIL import Image
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# El script de cada vehículo guarda la fuerza del motor multiplicada por 10
+# respecto a lo que enseña el juego (engineForce = 4451 se ve como 445.1).
+# Si no fuera así para algún caso, poner 1 para mostrar el valor del script.
+DIVISOR_FUERZA_MOTOR = 10
+
 
 # --- Carga de datos: vanilla + mods ---------------------------------------
 
@@ -211,7 +216,10 @@ def construir_embed_vehiculo(vehiculo):
     mostradas = 0
     for clave, etiqueta in ESTADISTICAS_VEHICULO:
         if clave in stats:
-            embed.add_field(name=etiqueta, value=f"{stats[clave]:g}", inline=True)
+            valor = stats[clave]
+            if clave == "engineForce":
+                valor = valor / DIVISOR_FUERZA_MOTOR
+            embed.add_field(name=etiqueta, value=f"{valor:g}", inline=True)
             mostradas += 1
 
     notas = []
