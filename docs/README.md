@@ -17,8 +17,9 @@ mods installed on the server, in several languages, directly from Discord.
 - `/getvehicleid <name>` — returns only the full vehicle ID
   (e.g. `Base.70barracuda`).
 - `/getvehicleinfo <name>` — returns a card with the name, ID, origin, and
-  the engine force, max speed, weight and seats. For vehicles from a mod it
-  also shows the mod's cover image.
+  the engine force, max speed, base weight, seats and storage (trunk +
+  seats + other containers). For vehicles from a mod it also shows the
+  mod's cover image.
 
 ### How search works
 
@@ -158,7 +159,9 @@ vanilla icons without shipping them.
 python tools/parse_vehicles.py "<game>/media" <workshop>/content/108600 data/vehicles.json
 ```
 
-It prints a summary with what it excluded and why. Two switches at the top
+It needs `data/items.json` and `data/items_mods.json` to exist already,
+because the capacity of many vehicle parts comes from the items. It prints
+a summary with what it excluded and why. Two switches at the top
 of the script control what is left out: non-functional vehicles (burnt or
 smashed wrecks) are always excluded, and trailers are excluded unless
 `REMOLQUES = True`.
@@ -208,16 +211,24 @@ screen/tmux) is still pending — see `ROADMAP.md`.
   game files. Vehicles from a mod show that mod's cover image (`preview.png`),
   which may show a different vehicle if the mod adds several. Vanilla
   vehicles have no image.
-- **Vehicle stats** (engine force, max speed, weight...) are the game's
+- **Vehicle stats** (engine force, max speed, base weight...) are the game's
   internal values, not horsepower or km/h, so they are only useful for
-  comparing vehicles with each other.
+  comparing vehicles with each other. The card shows the engine force as
+  the script value divided by 10, which is how the game displays it, and
+  calls the weight "Peso Base" because upgrades add weight to a vehicle.
+- **Storage** is the sum of the capacity of the trunk, the seats (without
+  the driver's) and the other containers (glove box, roof rack, gun rack,
+  extra drawers...), using each part's maximum capacity. The trunk capacity
+  drops as the part gets damaged, and a roof rack is always counted even if
+  a vehicle may not have it installed. When a container has no resolvable
+  capacity, the card shows a lower bound with a "≥" in front.
 - **Trailers are not included** for now, and neither are burnt or smashed
   vehicle wrecks. Trailers are detected by name and by missing engine or
   seats, so a trailer with an unusual name could slip through.
 
 ## Current status
 
-Items (vanilla and mods) work end to end and were tested on the
-IBEROZOID_Server test machine. The vehicle commands are the most recent
-addition: their data generates correctly, but check them in Discord after
-each change. See `ROADMAP.md` for what is done and what is pending.
+The bot works end to end with vanilla and mod items and vehicles, and the
+project is considered complete for now. What is still pending is operational
+(keeping the bot running after closing SSH, moving to the real server) and a
+few data gaps, all listed in `ROADMAP.md`.

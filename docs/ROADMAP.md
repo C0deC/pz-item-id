@@ -2,6 +2,9 @@
 
 Feature checklist. Marked `[x]` as items get completed.
 
+**Status:** the project is considered complete for now. What is left under
+"Pending" is operational or optional.
+
 ## Done
 
 ### Bot and environment
@@ -50,14 +53,24 @@ Feature checklist. Marked `[x]` as items get completed.
       missing engine/seats or by name
 - [x] Result: 595 vehicles (152 vanilla, 443 from mods), all with complete
       stats
+- [x] Engine force shown as the script value divided by 10, as the game
+      displays it (checked on the HMMWV)
+- [x] Weight labelled "Peso Base", because upgrades add weight
+- [x] Vehicle storage: containers resolved from parts, templates,
+      inheritance and items (trunk + seats without the driver's + other
+      containers), with "≥" when a capacity cannot be worked out
+- [x] Fake `TruckBed` parts (`itemType = nil`) recognised and ignored
+- [x] Item naming of parts handled for vanilla (`itemType` + vehicle type)
+      and for mods that name the item in full
+- [x] Engine quality and loudness taken out of the vehicle card
 
 ### Bot features
 - [x] `/getitemid <name>` — returns the item's ID
 - [x] `/getiteminfo <name>` — full card (name, ID, type, category, origin,
       icon)
 - [x] `/getvehicleid <name>` — returns the vehicle's ID
-- [x] `/getvehicleinfo <name>` — card with name, ID, origin, engine stats and
-      mod cover image
+- [x] `/getvehicleinfo <name>` — card with name, ID, origin, engine force,
+      max speed, base weight, seats, storage and mod cover image
 - [x] Multi-language search (exact, partial, similarity-based suggestions)
 - [x] Search by name only, never by internal ID (documented in DECISIONS.md)
 - [x] Search matches every word in any order, also against the mod's name
@@ -76,8 +89,6 @@ Feature checklist. Marked `[x]` as items get completed.
 
 ## Pending
 
-- [ ] Test the four commands in Discord after every data regeneration
-      (the vehicle commands are the newest)
 - [ ] Keep the bot running after closing SSH (systemd service, or
       screen/tmux as a quick option) — not decided yet
 - [ ] Move from the test machine to the real IBEROZOID_Server
@@ -86,6 +97,8 @@ Feature checklist. Marked `[x]` as items get completed.
       could be extended)
 - [ ] Automate regenerating `data/` when the game or the mod list changes
       (currently a manual process)
+- [ ] Recover the exact storage of the few vehicles that still show "≥"
+      (their container points to an item that is not in the data)
 - [ ] `README.md` / `DECISIONS.md` reviewed and adjusted to your liking
 
 ## Ideas for later (not committed yet)

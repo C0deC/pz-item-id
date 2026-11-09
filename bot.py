@@ -178,11 +178,12 @@ def construir_embed(item):
 
 # Estadísticas de vehículo que se muestran, en este orden. Solo aparecen
 # las que el vehículo tenga definidas. La calidad y el ruido del motor
-# siguen en vehicles.json, pero no se muestran.
+# siguen en vehicles.json, pero no se muestran. El peso es el del vehículo
+# sin mejoras: al instalarle piezas aumenta.
 ESTADISTICAS_VEHICULO = [
     ("engineForce", "Fuerza del motor"),
     ("maxSpeed", "Velocidad máx."),
-    ("mass", "Peso"),
+    ("mass", "Peso Base"),
     ("seats", "Asientos"),
 ]
 

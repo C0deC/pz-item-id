@@ -226,7 +226,7 @@ command returns the full card.
 | `/getitemid` | the item's full ID |
 | `/getiteminfo` | name, ID, type, category, origin, icon |
 | `/getvehicleid` | the vehicle's full ID |
-| `/getvehicleinfo` | name, ID, origin, engine stats, mod cover image |
+| `/getvehicleinfo` | name, ID, origin, engine force, max speed, base weight, seats, storage, mod cover image |
 
 **Why ID and info are separate:** different use cases — quickly copying an ID
 for an admin command, versus looking up the full details. A single command
@@ -338,14 +338,22 @@ there are no unresolved `template!` references.
 `vehicles.json`. Nested blocks (model, skin, wheels, parts) contain their own
 `key = value` lines and would otherwise overwrite the real values.
 
-**What the card shows:** only engine force, max speed, weight (the `mass`
-value, labelled "Peso" in the card) and seats. Engine quality and engine
+**What the card shows:** engine force, max speed, base weight, seats and
+storage. The weight is the `mass` value and is labelled "Peso Base" because
+adding upgrades to a vehicle increases its weight. Engine quality and engine
 loudness are still in the data but were taken out of the card on purpose:
 they are not useful when looking up a vehicle.
 
 **They are not horsepower.** They are the game's internal values with no real
 units, so the embed calls the first one "engine force" and adds a footer
 saying so. They are useful to compare vehicles with each other.
+
+**Engine force is shown divided by 10.** The script of the HMMWV holds 4451
+and the game shows 445.1, so the card divides the script value by 10
+(`DIVISOR_FUERZA_MOTOR` at the top of `bot.py`; setting it to 1 shows the raw
+script value). It was checked against that vehicle in the game and applied to
+every vehicle on the assumption that the game does the same conversion for
+all of them.
 
 **Image:** there is no picture of each individual vehicle in the game files.
 The `ui/vehicles` folder of the mod examined only held a mechanics overlay,
@@ -358,6 +366,62 @@ one named in `poster=` in `mod.info`), shrunk to 512 px and stored once per
 mod in `data/vehicle_previews/`. Vanilla vehicles get no image. The embed
 footer says "Image: mod cover" because in a mod with several vehicles the
 cover may show a different one.
+
+---
+
+## Vehicle storage
+
+**Where it comes from:** each vehicle declares its parts (`part TruckBed`,
+`part Seat*`, `part GloveBox`...). A part that can hold items has a
+`container { ... }` block. The parts are not all written in the vehicle's own
+script, so they are resolved in this order: the vehicle it inherits from
+(`template!`), the templates it includes (`template = Trunk/part/TruckBed`),
+and its own parts, where the wildcard `part Seat*` applies to every seat.
+
+**Where the capacity comes from**, in order:
+1. A `capacity` written in the container (vans have 130 or 160, mods give
+   their own trunks a value, e.g. 65 for the `70barracuda`).
+2. The item of the part, through its `itemType`, using the item's
+   `MaxCapacity`. Vanilla names the item with the vehicle's `mechanicType`
+   appended (`Base.SmallTrunk` + 3 -> `Base.SmallTrunk3`); the digit is the
+   vehicle type, not a quality level, and the items carry a `VehicleType`
+   field with the same number. Some mods name the item in full instead
+   (`Base.92amgeneralM998Roofrack`, `USMIL.Seat0`), and `itemType` can be a
+   list separated by `;`, so every candidate is tried: the vanilla naming
+   first, then the name as written.
+
+**What does not count as storage:**
+- Containers with a `contentType` (fuel and air), the fuel tank, the tires and
+  the battery.
+- Fake parts: no capacity and `itemType = nil`. Mods switch the generic
+  `TruckBed` off this way (`category = nodisplay`) and add their own trunk
+  with another name. Before this was understood, 440 vehicles looked like
+  they had an unresolved trunk.
+
+**How the pieces are grouped**, by the name of the part:
+- Trunk: the name contains "trunk", or it is `TruckBed` / `TruckBedOpen`.
+- Seats: names starting with `Seat`, except the driver's seat
+  (`SeatFrontLeft`), which is left out on purpose: if it is filled with items,
+  the player cannot get into the vehicle.
+- Others: anything else that holds items (glove box, roof rack, gun rack,
+  toolboxes, console, `...TruckBedExtras`).
+
+**The formula:** storage = trunk + (seats - 1) x seat capacity + other
+containers. It is calculated as the sum of the real seat parts without the
+driver's, which gives the same number when all seats are equal and is more
+accurate when they are not (for example, vehicles where the `seats` value
+does not match the seat parts).
+
+**What the card shows:** the total with the breakdown, e.g.
+`55 (trunk 30 + seats 20 + others 5)`. When some container has no capacity
+that can be resolved, the total is only a minimum and is shown as
+`≥ 122 (...)` with a note in the footer.
+
+**Known limits:** the trunk capacity is the maximum, with the part in perfect
+condition (it drops as the part is damaged). A roof rack always counts, even
+though a vehicle may not carry one by default. The grouping is by name, so a
+trunk with an unusual name would be counted under "others"; the total is not
+affected, only the breakdown.
 
 ---
 
@@ -400,6 +464,10 @@ warning), so a missing or older deployment does not stop the item commands.
   reports on the item itself. Noted as a possible future feature.
 - **Trailers as vehicles:** left out on purpose and controlled by the
   `REMOLQUES` switch; they may come back in a later update.
+- **Exact storage for every vehicle:** a few vehicles have a container
+  whose capacity cannot be worked out from the files (for example,
+  because it points to an item that is not in the data). They show a
+  lower bound (`≥`) instead of an exact number.
 - **A picture of each individual vehicle:** not available in the game files,
   so only the mod cover is used (see above).
 - **Remaining mod icons (355 items):** see "Mod icons" above.
